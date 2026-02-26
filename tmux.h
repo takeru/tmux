@@ -1992,6 +1992,15 @@ struct client {
 	u_int			 click_button;
 	struct mouse_event	 click_event;
 
+#define SCROLL_EVENT_BUF	96
+#define SCROLL_FAST_EVENTS	80 /* events/s for fast state */
+	struct timeval		 scroll_last_time;
+	int			 scroll_up;
+	uint64_t		 scroll_accum; /* milli-lines */
+	struct timeval		 scroll_events[SCROLL_EVENT_BUF];
+	u_int			 scroll_event_idx;
+	uint64_t		 scroll_fast_accum_ms;
+
 	struct status_line	 status;
 	enum client_theme	 theme;
 
@@ -3517,6 +3526,7 @@ void		 window_copy_scroll(struct window_pane *, int, u_int, int);
 void		 window_copy_pageup(struct window_pane *, int);
 void		 window_copy_pagedown(struct window_pane *, int, int);
 void		 window_copy_start_drag(struct client *, struct mouse_event *);
+int		 window_copy_scroll_one(struct window_pane *, int, u_int);
 char		*window_copy_get_word(struct window_pane *, u_int, u_int);
 char		*window_copy_get_line(struct window_pane *, u_int);
 int		 window_copy_get_current_offset(struct window_pane *, u_int *,
