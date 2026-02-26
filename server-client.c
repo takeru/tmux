@@ -1350,6 +1350,109 @@ have_event:
 			if (where == BORDER)
 				key = KEYC_WHEELDOWN_BORDER;
 		}
+		/* Scroll acceleration. */
+		if (where == PANE && c->session != NULL &&
+		    options_get_number(c->session->options,
+		    "scroll-acceleration")) {
+			struct timeval		 now, diff, one_sec_ago;
+			struct window_mode_entry *wme;
+			uint64_t		 delta_ms, max_lines, add;
+			int			 scroll_up_new;
+			u_int			 ev_count, j, lines;
+
+			wme = TAILQ_FIRST(&wp->modes);
+			if (wme == NULL) {
+				/* Not in copy mode; reset state. */
+				c->scroll_accum = 0;
+				c->scroll_fast_accum_ms = 0;
+				memset(&c->scroll_last_time, 0,
+				    sizeof c->scroll_last_time);
+				memset(c->scroll_events, 0,
+				    sizeof c->scroll_events);
+				c->scroll_event_idx = 0;
+				break;
+			}
+
+			gettimeofday(&now, NULL);
+			max_lines = options_get_number(
+			    c->session->options,
+			    "scroll-acceleration-max-speed");
+
+			scroll_up_new = (MOUSE_BUTTONS(b) ==
+			    MOUSE_WHEEL_UP);
+			if (scroll_up_new != c->scroll_up) {
+				/* Direction change: full reset. */
+				c->scroll_accum = 0;
+				c->scroll_fast_accum_ms = 0;
+				memset(c->scroll_events, 0,
+				    sizeof(c->scroll_events));
+				c->scroll_event_idx = 0;
+			}
+			c->scroll_up = scroll_up_new;
+
+			/* Event interval since last event. */
+			if (c->scroll_last_time.tv_sec == 0 &&
+			    c->scroll_last_time.tv_usec == 0)
+				delta_ms = 0;
+			else {
+				timersub(&now,
+				    &c->scroll_last_time, &diff);
+				delta_ms = diff.tv_sec * 1000ULL +
+				    diff.tv_usec / 1000ULL;
+			}
+			c->scroll_last_time = now;
+
+			/* Record event in ring buffer. */
+			c->scroll_events[c->scroll_event_idx] =
+			    now;
+			c->scroll_event_idx =
+			    (c->scroll_event_idx + 1) %
+			    SCROLL_EVENT_BUF;
+
+			/* Count events in last 1 second. */
+			one_sec_ago = now;
+			one_sec_ago.tv_sec -= 1;
+			ev_count = 0;
+			for (j = 0; j < SCROLL_EVENT_BUF; j++) {
+				if (timerisset(&c->scroll_events[j])
+				    && timercmp(&c->scroll_events[j],
+				    &one_sec_ago, >))
+					ev_count++;
+			}
+
+			/*
+			 * Fast state: +1x per 0.5s.
+			 * Slow state: -2x per 0.5s.
+			 * accum unit: 500 = +1x multiplier.
+			 */
+			if (ev_count >= SCROLL_FAST_EVENTS)
+				c->scroll_fast_accum_ms += delta_ms;
+			else if (c->scroll_fast_accum_ms >
+			    delta_ms * 2)
+				c->scroll_fast_accum_ms -=
+				    delta_ms * 2;
+			else
+				c->scroll_fast_accum_ms = 0;
+			if (c->scroll_fast_accum_ms > max_lines * 500)
+				c->scroll_fast_accum_ms = max_lines * 500;
+
+			/*
+			 * Multiplier = 1.0 + accum / 500.
+			 * In milli-lines: add = 1000 + accum * 2.
+			 */
+			add = 1000 + c->scroll_fast_accum_ms * 2;
+			if (add > max_lines * 1000)
+				add = max_lines * 1000;
+
+			/* Accumulate and scroll. */
+			c->scroll_accum += add;
+			key = KEYC_UNKNOWN;
+			lines = c->scroll_accum / 1000;
+			c->scroll_accum %= 1000;
+			if (lines > 0)
+				window_copy_scroll_one(wp,
+				    c->scroll_up, lines);
+		}
 		break;
 	case UP:
 		switch (MOUSE_BUTTONS(b)) {

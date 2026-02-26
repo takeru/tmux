@@ -789,6 +789,23 @@ const struct options_table_entry options_table[] = {
 		  "with the '-r' flag."
 	},
 
+	{ .name = "scroll-acceleration",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .default_num = 0,
+	  .text = "Enable mouse scroll wheel acceleration."
+	},
+
+	{ .name = "scroll-acceleration-max-speed",
+	  .type = OPTIONS_TABLE_NUMBER,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .minimum = 2,
+	  .maximum = 100,
+	  .default_num = 10,
+	  .text = "Maximum lines per wheel event at full "
+		  "scroll acceleration."
+	},
+
 	{ .name = "set-titles",
 	  .type = OPTIONS_TABLE_FLAG,
 	  .scope = OPTIONS_TABLE_SESSION,

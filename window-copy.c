@@ -6202,3 +6202,28 @@ window_copy_acquire_cursor_down(struct window_mode_entry *wme, u_int hsize,
 	if (window_copy_update_selection(wme, 1, no_reset))
 		window_copy_redraw_lines(wme, oldy, nd);
 }
+
+int
+window_copy_scroll_one(struct window_pane *wp, int scroll_up, u_int lines)
+{
+	struct window_mode_entry	*wme;
+	struct window_copy_mode_data	*data;
+
+	wme = TAILQ_FIRST(&wp->modes);
+	if (wme == NULL)
+		return (1);
+	if (wme->mode != &window_copy_mode && wme->mode != &window_view_mode)
+		return (1);
+	if (scroll_up)
+		window_copy_scroll_down(wme, lines);
+	else {
+		window_copy_scroll_up(wme, lines);
+		data = wme->data;
+		if (data->oy == 0) {
+			window_pane_reset_mode(wp);
+			return (1);
+		}
+	}
+	wp->flags |= PANE_REDRAW;
+	return (0);
+}
