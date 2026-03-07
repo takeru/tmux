@@ -2239,6 +2239,17 @@ format_cb_pane_pipe(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Callback for pane_pipe_pid. */
+static void *
+format_cb_pane_pipe_pid(struct format_tree *ft)
+{
+	char	*value = NULL;
+
+	if (ft->wp != NULL && ft->wp->pipe_fd != -1)
+		xasprintf(&value, "%ld", (long)ft->wp->pipe_pid);
+	return (value);
+}
+
 /* Callback for pane_right. */
 static void *
 format_cb_pane_right(struct format_tree *ft)
@@ -3328,6 +3339,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "pane_pipe", FORMAT_TABLE_STRING,
 	  format_cb_pane_pipe
+	},
+	{ "pane_pipe_pid", FORMAT_TABLE_STRING,
+	  format_cb_pane_pipe_pid
 	},
 	{ "pane_right", FORMAT_TABLE_STRING,
 	  format_cb_pane_right
@@ -4447,6 +4461,9 @@ format_loop_sessions(struct format_expand_state *es, const char *fmt)
 		free(expanded);
 	}
 
+	free(active);
+	free(all);
+
 	return (value);
 }
 
@@ -5239,13 +5256,11 @@ format_replace(struct format_expand_state *es, const char *key, size_t keylen,
 done:
 	/* Expand again if required. */
 	if (modifiers & FORMAT_EXPAND) {
-		format_copy_state(&next, es, FORMAT_EXPAND_NOJOBS);
-		new = format_expand1(&next, value);
+		new = format_expand1(es, value);
 		free(value);
 		value = new;
 	} else if (modifiers & FORMAT_EXPANDTIME) {
-		format_copy_state(&next, es, FORMAT_EXPAND_TIME|
-		    FORMAT_EXPAND_NOJOBS);
+		format_copy_state(&next, es, FORMAT_EXPAND_TIME);
 		new = format_expand1(&next, value);
 		free(value);
 		value = new;
