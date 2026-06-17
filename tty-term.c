@@ -280,6 +280,7 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_SMULX] = { TTYCODE_STRING, "Smulx" },
 	[TTYC_SMUL] = { TTYCODE_STRING, "smul" },
 	[TTYC_SMXX] =  { TTYCODE_STRING, "smxx" },
+	[TTYC_SPB] = { TTYCODE_STRING, "Spb" },
 	[TTYC_SS] = { TTYCODE_STRING, "Ss" },
 	[TTYC_SWD] = { TTYCODE_STRING, "Swd" },
 	[TTYC_SYNC] = { TTYCODE_STRING, "Sync" },
@@ -773,6 +774,18 @@ int
 tty_term_has(struct tty_term *term, enum tty_code_code code)
 {
 	return (term->codes[code].type != TTYCODE_NONE);
+}
+
+int
+tty_term_has_name(struct tty_term *term, const char *name)
+{
+	u_int	i;
+
+	for (i = 0; i < tty_term_ncodes(); i++) {
+		if (strcmp(tty_term_codes[i].name, name) == 0)
+			return (tty_term_has(term, i));
+	}
+	return (0);
 }
 
 const char *

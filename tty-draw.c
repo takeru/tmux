@@ -22,6 +22,7 @@
 
 #include "tmux.h"
 
+/* Current state when drawing line. */
 enum tty_draw_line_state {
 	TTY_DRAW_LINE_FIRST,
 	TTY_DRAW_LINE_FLUSH,
@@ -29,7 +30,6 @@ enum tty_draw_line_state {
 	TTY_DRAW_LINE_NEW2,
 	TTY_DRAW_LINE_EMPTY,
 	TTY_DRAW_LINE_SAME,
-	TTY_DRAW_LINE_PAD,
 	TTY_DRAW_LINE_DONE
 };
 static const char* tty_draw_line_states[] = {
@@ -39,7 +39,6 @@ static const char* tty_draw_line_states[] = {
 	"NEW2",
 	"EMPTY",
 	"SAME",
-	"PAD",
 	"DONE"
 };
 
@@ -53,7 +52,10 @@ tty_draw_line_clear(struct tty *tty, u_int px, u_int py, u_int nx,
 		return;
 
 	/* If genuine BCE is available, can try escape sequences. */
-	if (!wrapped && nx >= 10 && !tty_fake_bce(tty, defaults, bg)) {
+	if (tty->client->overlay_check == NULL &&
+	    !wrapped &&
+	    nx >= 10 &&
+	    !tty_fake_bce(tty, defaults, bg)) {
 		/* Off the end of the line, use EL if available. */
 		if (px + nx >= tty->sx && tty_term_has(tty->term, TTYC_EL)) {
 			tty_cursor(tty, px, py);
@@ -87,30 +89,10 @@ tty_draw_line_clear(struct tty *tty, u_int px, u_int py, u_int nx,
 		tty_repeat_space(tty, nx);
 }
 
-/* Is this cell empty? */
-static u_int
-tty_draw_line_get_empty(const struct grid_cell *gc, u_int nx)
-{
-	u_int	empty = 0;
-
-	if (gc->data.width != 1 && gc->data.width > nx)
-		empty = nx;
-	else if (gc->attr == 0 && gc->link == 0) {
-		if (gc->flags & GRID_FLAG_CLEARED)
-			empty = 1;
-		else if (gc->flags & GRID_FLAG_TAB)
-			empty = gc->data.width;
-		else if (gc->data.size == 1 && *gc->data.data == ' ')
-			empty = 1;
-	}
-	return (empty);
-}
-
 /* Draw a line from screen to tty. */
 void
 tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
-    u_int atx, u_int aty, const struct grid_cell *defaults,
-    struct colour_palette *palette)
+    u_int atx, u_int aty, const struct tty_style_ctx *style_ctx)
 {
 	struct grid		*gd = s->grid;
 	const struct grid_cell	*gcp;
@@ -122,6 +104,14 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	char			 buf[1000];
 	size_t			 len;
 	enum tty_draw_line_state current_state, next_state;
+	struct tty_style_ctx	 default_style_ctx = { 0 };
+
+
+	if (style_ctx == NULL) {
+		default_style_ctx.defaults = &grid_default_cell;
+		default_style_ctx.hyperlinks = s->hyperlinks;
+		style_ctx = &default_style_ctx;
+	}
 
 	/*
 	 * py is the line in the screen to draw. px is the start x and nx is
@@ -130,6 +120,14 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	log_debug("%s: px=%u py=%u nx=%u atx=%u aty=%u", __func__, px, py, nx,
 	    atx, aty);
 
+	/* There is no point in drawing more than the end of the terminal. */
+	if (atx >= tty->sx)
+		return;
+	if (atx + nx >= tty->sx)
+		nx = tty->sx - atx;
+	if (nx == 0)
+		return;
+
 	/*
 	 * Clamp the width to cellsize - note this is not cellused, because
 	 * there may be empty background cells after it (from BCE).
@@ -137,18 +135,23 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	cellsize = grid_get_line(gd, gd->hsize + py)->cellsize;
 	if (screen_size_x(s) > cellsize)
 		ex = cellsize;
-	else {
+	else
 		ex = screen_size_x(s);
-		if (px > ex)
-			return;
-		if (px + nx > ex)
-			nx = ex - px;
-	}
-	if (ex < nx)
-		ex = nx;
 	log_debug("%s: drawing %u-%u,%u (end %u) at %u,%u; defaults: fg=%d, "
-	    "bg=%d", __func__, px, px + nx, py, ex, atx, aty, defaults->fg,
-	    defaults->bg);
+	    "bg=%d", __func__, px, px + nx, py, ex, atx, aty,
+	    style_ctx->defaults->fg, style_ctx->defaults->bg);
+
+	/* Turn off cursor while redrawing and reset region and margins. */
+	flags = (tty->flags & TTY_NOCURSOR);
+	tty->flags |= TTY_NOCURSOR;
+	tty_update_mode(tty, tty->mode, s);
+	tty_region_off(tty);
+	tty_margin_off(tty);
+
+	/* Start with the default cell as the last cell. */
+	memcpy(&last, &grid_default_cell, sizeof last);
+	last.bg = style_ctx->defaults->bg;
+	tty_default_attributes(tty, 8, style_ctx);
 
 	/*
 	 * If there is padding at the start, we must have truncated a wide
@@ -169,7 +172,7 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 				break;
 		}
 		if (i == 0)
-			bg = defaults->bg;
+			bg = style_ctx->defaults->bg;
 		else {
 			bg = gc.bg;
 			if (gc.flags & GRID_FLAG_SELECTED) {
@@ -178,15 +181,14 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 					bg = ngc.bg;
 			}
 		}
-		tty_attributes(tty, &last, defaults, palette, s->hyperlinks);
+		tty_attributes(tty, &last, style_ctx);
 		log_debug("%s: clearing %u padding cells", __func__, cx);
-		tty_draw_line_clear(tty, atx, aty, cx, defaults, bg, 0);
+		tty_draw_line_clear(tty, atx, aty, cx, style_ctx->defaults, bg, 0);
 		if (cx == ex)
-			return;
+			goto out;
 		atx += cx;
 		px += cx;
 		nx -= cx;
-		ex -= cx;
 	}
 
 	/* Did the previous line wrap on to this one? */
@@ -195,18 +197,6 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 		if (gl->flags & GRID_LINE_WRAPPED)
 			wrapped = 1;
 	}
-
-	/* Turn off cursor while redrawing and reset region and margins. */
-	flags = (tty->flags & TTY_NOCURSOR);
-	tty->flags |= TTY_NOCURSOR;
-	tty_update_mode(tty, tty->mode, s);
-	tty_region_off(tty);
-	tty_margin_off(tty);
-
-	/* Start with the default cell as the last cell. */
-	memcpy(&last, &grid_default_cell, sizeof last);
-	last.bg = defaults->bg;
-	tty_default_attributes(tty, defaults, palette, 8, s->hyperlinks);
 
 	/* Loop over each character in the range. */
 	last_i = i = 0;
@@ -225,6 +215,9 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 			next_state = TTY_DRAW_LINE_DONE;
 			gcp = &grid_default_cell;
 		} else {
+			if (i > nx)
+				fatalx("position %u > width %u", i, nx);
+
 			/* Get the current cell. */
 			grid_view_get_cell(gd, px + i, py, &gc);
 
@@ -239,20 +232,36 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 			}
 
 			/* Work out the the empty width. */
-			if (i >= ex)
+			empty = 0;
+			if (px >= ex || i >= ex - px) {
+				/* Outside the area being drawn. */
 				empty = 1;
-			else if (gcp->bg != last.bg)
-				empty = 0;
-			else
-				empty = tty_draw_line_get_empty(gcp, nx - i);
+			} else if (gcp->data.width > nx - i) {
+				/* Wide character that has been truncated. */
+				empty = nx - i;
+			} else if (gcp->flags & GRID_FLAG_PADDING) {
+				/* Orphan padding cell. */
+				empty = 1;
+			} else if (gcp->bg == last.bg && gcp->attr == 0 &&
+			    gcp->link == 0) {
+				/*
+				 * No attributes - empty if cleared, tab or
+				 * space.
+				 */
+				if (gcp->flags & GRID_FLAG_CLEARED)
+					empty = 1;
+				else if (gcp->flags & GRID_FLAG_TAB)
+					empty = gcp->data.width;
+				else if (gcp->data.size == 1 &&
+				    *gcp->data.data == ' ')
+					empty = 1;
+			}
 
 			/* Work out the next state. */
 			if (empty != 0)
 				next_state = TTY_DRAW_LINE_EMPTY;
 			else if (current_state == TTY_DRAW_LINE_FIRST)
 				next_state = TTY_DRAW_LINE_SAME;
-			else if (gcp->flags & GRID_FLAG_PADDING)
-				next_state = TTY_DRAW_LINE_PAD;
 			else if (grid_cells_look_equal(gcp, &last)) {
 				if (gcp->data.size > (sizeof buf) - len)
 					next_state = TTY_DRAW_LINE_FLUSH;
@@ -273,15 +282,14 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 		/* If the state has changed, flush any collected data. */
 		if (next_state != current_state) {
 			if (current_state == TTY_DRAW_LINE_EMPTY) {
-				tty_attributes(tty, &last, defaults, palette,
-				    s->hyperlinks);
+				tty_attributes(tty, &last, style_ctx);
 				tty_draw_line_clear(tty, atx + last_i, aty,
-				    i - last_i, defaults, last.bg, wrapped);
+				    i - last_i, style_ctx->defaults, last.bg,
+				    wrapped);
 				wrapped = 0;
 			} else if (next_state != TTY_DRAW_LINE_SAME &&
 			    len != 0) {
-				tty_attributes(tty, &last, defaults, palette,
-				    s->hyperlinks);
+				tty_attributes(tty, &last, style_ctx);
 				if (atx + i - width != 0 || !wrapped)
 					tty_cursor(tty, atx + i - width, aty);
 				if (~last.attr & GRID_ATTR_CHARSET)
@@ -298,8 +306,7 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 		}
 
 		/* Append the cell if it is not empty and not padding. */
-		if (next_state != TTY_DRAW_LINE_EMPTY &&
-		    next_state != TTY_DRAW_LINE_PAD) {
+		if (next_state != TTY_DRAW_LINE_EMPTY) {
 			memcpy(buf + len, gcp->data.data, gcp->data.size);
 			len += gcp->data.size;
 			width += gcp->data.width;
@@ -318,7 +325,7 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 			i += gcp->data.width;
 	}
 
+out:
 	tty->flags = (tty->flags & ~TTY_NOCURSOR)|flags;
 	tty_update_mode(tty, tty->mode, s);
 }
-

@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 
 #include <ctype.h>
 #include <errno.h>
@@ -71,7 +72,7 @@ static struct window_pane *window_pane_create(struct window *, u_int, u_int,
 		    u_int);
 static void	window_pane_destroy(struct window_pane *);
 static void	window_pane_full_size_offset(struct window_pane *wp,
-		    u_int *xoff, u_int *yoff, u_int *sx, u_int *sy);
+		    int *xoff, int *yoff, u_int *sx, u_int *sy);
 
 RB_GENERATE(windows, window, entry, window_cmp);
 RB_GENERATE(winlinks, winlink, entry, winlink_cmp);
@@ -306,6 +307,7 @@ window_create(u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 	w->flags = 0;
 
 	TAILQ_INIT(&w->panes);
+	TAILQ_INIT(&w->z_index);
 	TAILQ_INIT(&w->last_panes);
 	w->active = NULL;
 
@@ -346,10 +348,8 @@ window_destroy(struct window *w)
 	window_unzoom(w, 0);
 	RB_REMOVE(windows, &windows, w);
 
-	if (w->layout_root != NULL)
-		layout_free_cell(w->layout_root);
-	if (w->saved_layout_root != NULL)
-		layout_free_cell(w->saved_layout_root);
+	layout_free_cell(w->layout_root);
+	layout_free_cell(w->saved_layout_root);
 	free(w->old_layout);
 
 	window_destroy_panes(w);
@@ -374,14 +374,19 @@ window_pane_destroy_ready(struct window_pane *wp)
 {
 	int	n;
 
-	if (wp->pipe_fd != -1) {
-		if (EVBUFFER_LENGTH(wp->pipe_event->output) != 0)
-			return (0);
-		if (ioctl(wp->fd, FIONREAD, &n) != -1 && n > 0)
-			return (0);
-	}
+	if (wp->pipe_fd != -1 && EVBUFFER_LENGTH(wp->pipe_event->output) != 0)
+		return (0);
+	if (ioctl(wp->fd, FIONREAD, &n) != -1 && n > 0)
+		return (0);
 
 	if (~wp->flags & PANE_EXITED)
+		return (0);
+
+	/*
+	 * If a command queue item is blocked on this pane, wait for the
+	 * child's exit status before destroying it.
+	 */
+	if (wp->wait_item != NULL && (~wp->flags & PANE_STATUSREADY))
 		return (0);
 	return (1);
 }
@@ -404,11 +409,16 @@ window_remove_ref(struct window *w, const char *from)
 }
 
 void
-window_set_name(struct window *w, const char *new_name)
+window_set_name(struct window *w, const char *new_name, const char *forbid)
 {
-	free(w->name);
-	utf8_stravis(&w->name, new_name, VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
-	notify_window("window-renamed", w);
+	char	*name;
+
+	name = clean_name(new_name, forbid);
+	if (name != NULL) {
+		free(w->name);
+		w->name = name;
+		notify_window("window-renamed", w);
+	}
 }
 
 void
@@ -457,6 +467,18 @@ window_pane_send_resize(struct window_pane *wp, u_int sx, u_int sy)
 		if (errno != EINVAL && errno != ENXIO)
 #endif
 		fatal("ioctl failed");
+}
+
+int
+window_has_floating_panes(struct window *w)
+{
+	struct window_pane	*wp;
+
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (window_pane_is_floating(wp))
+			return (1);
+	}
+	return (0);
 }
 
 int
@@ -527,6 +549,8 @@ window_set_active_pane(struct window *w, struct window_pane *wp, int notify)
 
 	if (wp == w->active)
 		return (0);
+	if (w->flags & WINDOW_ZOOMED)
+		window_unzoom(w, 1);
 	lastwp = w->active;
 
 	window_pane_stack_remove(&w->last_panes, wp);
@@ -542,6 +566,7 @@ window_set_active_pane(struct window *w, struct window_pane *wp, int notify)
 	}
 
 	tty_update_window_offset(w);
+	server_redraw_window(w);
 
 	if (notify)
 		notify_window("window-pane-changed", w);
@@ -588,7 +613,17 @@ window_redraw_active_switch(struct window *w, struct window_pane *wp)
 		}
 		if (wp == w->active)
 			break;
+
+		/* If the pane is floating, move to the front. */
+		if (window_pane_is_floating(wp)) {
+			TAILQ_REMOVE(&w->z_index, wp, zentry);
+			TAILQ_INSERT_HEAD(&w->z_index, wp, zentry);
+			wp->flags |= PANE_REDRAW;
+		}
+
 		wp = w->active;
+		if (wp == NULL)
+			break;
 	}
 }
 
@@ -596,16 +631,62 @@ struct window_pane *
 window_get_active_at(struct window *w, u_int x, u_int y)
 {
 	struct window_pane	*wp;
-	u_int			 xoff, yoff, sx, sy;
+	int			 pane_status, xoff, yoff;
+	u_int			 sx, sy;
 
-	TAILQ_FOREACH(wp, &w->panes, entry) {
-		if (!window_pane_visible(wp))
+	pane_status = window_get_pane_status(w);
+
+	if (pane_status == PANE_STATUS_TOP) {
+		/*
+		 * Prefer a pane's top border status line over the pane above's
+		 * bottom border.
+		 */
+		TAILQ_FOREACH(wp, &w->z_index, zentry) {
+			if (!window_pane_is_visible(wp) ||
+			    window_pane_is_floating(wp))
+				continue;
+
+			window_pane_full_size_offset(wp, &xoff, &yoff, &sx,
+			    &sy);
+			if ((int)x < xoff || x > xoff + sx)
+				continue;
+			if ((int)y == yoff - 1)
+				return (wp);
+		}
+	}
+
+	TAILQ_FOREACH(wp, &w->z_index, zentry) {
+		if (!window_pane_is_visible(wp))
 			continue;
 		window_pane_full_size_offset(wp, &xoff, &yoff, &sx, &sy);
-		if (x < xoff || x > xoff + sx)
-			continue;
-		if (y < yoff || y > yoff + sy)
-			continue;
+		if (!window_pane_is_floating(wp)) {
+			/*
+			 * Tiled - to and including the right border, excluding
+			 * the bottom border.
+			 */
+			if ((int)x < xoff || x > xoff + sx)
+				continue;
+			if (pane_status == PANE_STATUS_TOP) {
+				if ((int)y < yoff - 1 || y > yoff + sy)
+					continue;
+			} else {
+				if ((int)y < yoff || y > yoff + sy)
+					continue;
+			}
+		} else {
+			if (window_pane_get_pane_lines(wp) == PANE_LINES_NONE) {
+				if ((int)x < xoff || (int)x >= xoff + (int)sx)
+					continue;
+				if ((int)y < yoff || (int)y >= yoff + (int)sy)
+					continue;
+			} else {
+				/* Floating - include all borders. */
+				if ((int)x < xoff - 1 || x > xoff + sx)
+					continue;
+				if ((int)y < yoff - 1 || y > yoff + sy)
+					continue;
+			}
+		}
 		return (wp);
 	}
 	return (NULL);
@@ -620,7 +701,7 @@ window_find_string(struct window *w, const char *s)
 	x = w->sx / 2;
 	y = w->sy / 2;
 
-	status = options_get_number(w->options, "pane-border-status");
+	status = window_get_pane_status(w);
 	if (status == PANE_STATUS_TOP)
 		top++;
 	else if (status == PANE_STATUS_BOTTOM)
@@ -660,12 +741,12 @@ window_zoom(struct window_pane *wp)
 
 	if (w->flags & WINDOW_ZOOMED)
 		return (-1);
-
-	if (window_count_panes(w) == 1)
+	if (window_count_panes(w, 1) == 1)
 		return (-1);
 
 	if (w->active != wp)
 		window_set_active_pane(w, wp, 1);
+	wp->flags |= PANE_ZOOMED;
 
 	TAILQ_FOREACH(wp1, &w->panes, entry) {
 		wp1->saved_layout_cell = wp1->layout_cell;
@@ -696,6 +777,7 @@ window_unzoom(struct window *w, int notify)
 	TAILQ_FOREACH(wp, &w->panes, entry) {
 		wp->layout_cell = wp->saved_layout_cell;
 		wp->saved_layout_cell = NULL;
+		wp->flags &= ~PANE_ZOOMED;
 	}
 	layout_fix_panes(w, NULL);
 
@@ -748,10 +830,15 @@ window_add_pane(struct window *w, struct window_pane *other, u_int hlimit,
 			TAILQ_INSERT_BEFORE(other, wp, entry);
 	} else {
 		log_debug("%s: @%u after %%%u", __func__, w->id, wp->id);
-		if (flags & SPAWN_FULLSIZE)
+		if (flags & (SPAWN_FULLSIZE|SPAWN_FLOATING))
 			TAILQ_INSERT_TAIL(&w->panes, wp, entry);
 		else
 			TAILQ_INSERT_AFTER(&w->panes, other, wp, entry);
+	}
+	if (~flags & SPAWN_FLOATING)
+		TAILQ_INSERT_TAIL(&w->z_index, wp, zentry);
+	else {
+		TAILQ_INSERT_HEAD(&w->z_index, wp, zentry);
 	}
 	return (wp);
 }
@@ -785,8 +872,8 @@ void
 window_remove_pane(struct window *w, struct window_pane *wp)
 {
 	window_lost_pane(w, wp);
-
 	TAILQ_REMOVE(&w->panes, wp, entry);
+	TAILQ_REMOVE(&w->z_index, wp, zentry);
 	window_pane_destroy(wp);
 }
 
@@ -831,8 +918,8 @@ window_pane_previous_by_number(struct window *w, struct window_pane *wp,
 int
 window_pane_index(struct window_pane *wp, u_int *i)
 {
-	struct window_pane	*wq;
 	struct window		*w = wp->window;
+	struct window_pane	*wq;
 
 	*i = options_get_number(w->options, "pane-base-index");
 	TAILQ_FOREACH(wq, &w->panes, entry) {
@@ -845,15 +932,36 @@ window_pane_index(struct window_pane *wp, u_int *i)
 	return (-1);
 }
 
+int
+window_pane_zindex(struct window_pane *wp, u_int *i)
+{
+	struct window		*w = wp->window;
+	struct window_pane	*wq;
+
+	*i = 0;
+	TAILQ_FOREACH(wq, &w->z_index, zentry) {
+		if (wq == wp) {
+			if (!window_pane_is_floating(wp))
+				(*i)++;
+			return (0);
+		}
+		if (window_pane_is_floating(wq))
+			(*i)++;
+	}
+
+	return (-1);
+}
+
 u_int
-window_count_panes(struct window *w)
+window_count_panes(struct window *w, int with_floating)
 {
 	struct window_pane	*wp;
-	u_int			 n;
+	u_int			 n = 0;
 
-	n = 0;
-	TAILQ_FOREACH(wp, &w->panes, entry)
-		n++;
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (with_floating || !window_pane_is_floating(wp))
+			n++;
+	}
 	return (n);
 }
 
@@ -870,6 +978,7 @@ window_destroy_panes(struct window *w)
 	while (!TAILQ_EMPTY(&w->panes)) {
 		wp = TAILQ_FIRST(&w->panes);
 		TAILQ_REMOVE(&w->panes, wp, entry);
+		TAILQ_REMOVE(&w->z_index, wp, zentry);
 		window_pane_destroy(wp);
 	}
 }
@@ -879,9 +988,8 @@ window_printable_flags(struct winlink *wl, int escape)
 {
 	struct session	*s = wl->session;
 	static char	 flags[32];
-	int		 pos;
+	u_int		 pos = 0;
 
-	pos = 0;
 	if (wl->flags & WINLINK_ACTIVITY) {
 		flags[pos++] = '#';
 		if (escape)
@@ -899,6 +1007,25 @@ window_printable_flags(struct winlink *wl, int escape)
 		flags[pos++] = 'M';
 	if (wl->window->flags & WINDOW_ZOOMED)
 		flags[pos++] = 'Z';
+	flags[pos] = '\0';
+	return (flags);
+}
+
+const char *
+window_pane_printable_flags(struct window_pane *wp)
+{
+	struct window	*w = wp->window;
+	static char	 flags[32];
+	int		 pos = 0;
+
+	if (wp == w->active)
+		flags[pos++] = '*';
+	if (wp == TAILQ_FIRST(&w->last_panes))
+		flags[pos++] = '-';
+	if (wp->flags & PANE_ZOOMED)
+		flags[pos++] = 'Z';
+	if (window_pane_is_floating(wp))
+		flags[pos++] = 'F';
 	flags[pos] = '\0';
 	return (flags);
 }
@@ -966,18 +1093,42 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 	window_pane_default_cursor(wp);
 
 	screen_init(&wp->status_screen, 1, 1, 0);
+	style_ranges_init(&wp->border_status_line.ranges);
 
 	if (gethostname(host, sizeof host) == 0)
-		screen_set_title(&wp->base, host);
+		screen_set_title(&wp->base, host, 0);
 
 	return (wp);
+}
+
+void
+window_pane_wait_finish(struct window_pane *wp)
+{
+	struct cmdq_item	*item = wp->wait_item;
+	struct client		*c;
+	int			 retval = 0;
+
+	if (item == NULL)
+		return;
+	wp->wait_item = NULL;
+
+	if (wp->flags & PANE_STATUSREADY) {
+		if (WIFEXITED(wp->status))
+			retval = WEXITSTATUS(wp->status);
+		else if (WIFSIGNALED(wp->status))
+			retval = WTERMSIG(wp->status) + 128;
+	}
+
+	c = cmdq_get_client(item);
+	if (c != NULL && c->session == NULL)
+		c->retval = retval;
+	cmdq_continue(item);
 }
 
 static void
 window_pane_destroy(struct window_pane *wp)
 {
-	struct window_pane_resize	*r;
-	struct window_pane_resize	*r1;
+	window_pane_wait_finish(wp);
 
 	window_pane_reset_mode_all(wp);
 	free(wp->searchstr);
@@ -1006,10 +1157,7 @@ window_pane_destroy(struct window_pane *wp)
 		event_del(&wp->resize_timer);
 	if (event_initialized(&wp->sync_timer))
 		event_del(&wp->sync_timer);
-	TAILQ_FOREACH_SAFE(r, &wp->resize_queue, entry, r1) {
-		TAILQ_REMOVE(&wp->resize_queue, r, entry);
-		free(r);
-	}
+	window_pane_clear_resizes(wp, NULL);
 
 	RB_REMOVE(window_pane_tree, &all_window_panes, wp);
 
@@ -1018,6 +1166,7 @@ window_pane_destroy(struct window_pane *wp)
 	free(wp->shell);
 	cmd_free_argv(wp->argc, wp->argv);
 	colour_palette_free(&wp->palette);
+	style_ranges_free(&wp->border_status_line.ranges);
 	free(wp);
 }
 
@@ -1077,6 +1226,19 @@ window_pane_set_event(struct window_pane *wp)
 }
 
 void
+window_pane_clear_resizes(struct window_pane *wp, struct window_pane_resize *except)
+{
+	struct window_pane_resize	*r, *r1;
+
+	TAILQ_FOREACH_SAFE(r, &wp->resize_queue, entry, r1) {
+		if (r == except)
+			continue;
+		TAILQ_REMOVE(&wp->resize_queue, r, entry);
+		free(r);
+	}
+}
+
+void
 window_pane_resize(struct window_pane *wp, u_int sx, u_int sy)
 {
 	struct window_mode_entry	*wme;
@@ -1132,6 +1294,7 @@ window_pane_set_mode(struct window_pane *wp, struct window_pane *swp,
 		TAILQ_INSERT_HEAD(&wp->modes, wme, entry);
 		wme->screen = wme->mode->init(wme, fs, args);
 	}
+	wme->kill = args != NULL ? args_has(args, 'k') : 0;
 	wp->screen = wme->screen;
 
 	wp->flags |= (PANE_REDRAW|PANE_REDRAWSCROLLBAR|PANE_CHANGED);
@@ -1149,11 +1312,13 @@ window_pane_reset_mode(struct window_pane *wp)
 {
 	struct window_mode_entry	*wme, *next;
 	struct window			*w = wp->window;
+	int				 kill;
 
 	if (TAILQ_EMPTY(&wp->modes))
 		return;
 
 	wme = TAILQ_FIRST(&wp->modes);
+	kill = wme->kill;
 	TAILQ_REMOVE(&wp->modes, wme, entry);
 	wme->mode->free(wme);
 	free(wme);
@@ -1176,6 +1341,9 @@ window_pane_reset_mode(struct window_pane *wp)
 	server_redraw_window_borders(wp->window);
 	server_status_window(wp->window);
 	notify_pane("pane-mode-changed", wp);
+
+	if (kill)
+		server_kill_pane(wp);
 }
 
 void
@@ -1188,14 +1356,14 @@ window_pane_reset_mode_all(struct window_pane *wp)
 static void
 window_pane_copy_paste(struct window_pane *wp, char *buf, size_t len)
 {
- 	struct window_pane	*loop;
+	struct window_pane	*loop;
 
 	TAILQ_FOREACH(loop, &wp->window->panes, entry) {
 		if (loop != wp &&
 		    TAILQ_EMPTY(&loop->modes) &&
 		    loop->fd != -1 &&
 		    (~loop->flags & PANE_INPUTOFF) &&
-		    window_pane_visible(loop) &&
+		    window_pane_is_visible(loop) &&
 		    options_get_number(loop->options, "synchronize-panes")) {
 			log_debug("%s: %.*s", __func__, (int)len, buf);
 			bufferevent_write(loop->event, buf, len);
@@ -1206,14 +1374,14 @@ window_pane_copy_paste(struct window_pane *wp, char *buf, size_t len)
 static void
 window_pane_copy_key(struct window_pane *wp, key_code key)
 {
- 	struct window_pane	*loop;
+	struct window_pane	*loop;
 
 	TAILQ_FOREACH(loop, &wp->window->panes, entry) {
 		if (loop != wp &&
 		    TAILQ_EMPTY(&loop->modes) &&
 		    loop->fd != -1 &&
 		    (~loop->flags & PANE_INPUTOFF) &&
-		    window_pane_visible(loop) &&
+		    window_pane_is_visible(loop) &&
 		    options_get_number(loop->options, "synchronize-panes"))
 			input_key_pane(loop, key, NULL);
 	}
@@ -1270,7 +1438,7 @@ window_pane_key(struct window_pane *wp, struct client *c, struct session *s,
 }
 
 int
-window_pane_visible(struct window_pane *wp)
+window_pane_is_visible(struct window_pane *wp)
 {
 	if (~wp->window->flags & WINDOW_ZOOMED)
 		return (1);
@@ -1355,7 +1523,7 @@ window_pane_choose_best(struct window_pane **list, u_int size)
  * scrollbars if they were visible but not including the border(s).
  */
 static void
-window_pane_full_size_offset(struct window_pane *wp, u_int *xoff, u_int *yoff,
+window_pane_full_size_offset(struct window_pane *wp, int *xoff, int *yoff,
     u_int *sx, u_int *sy)
 {
 	struct window		*w = wp->window;
@@ -1389,14 +1557,14 @@ window_pane_find_up(struct window_pane *wp)
 {
 	struct window		*w;
 	struct window_pane	*next, *best, **list;
-	u_int			 edge, left, right, end, size;
-	int			 status, found;
-	u_int			 xoff, yoff, sx, sy;
+	int			 edge, left, right, end, status, found;
+	int			 xoff, yoff;
+	u_int			 size, sx, sy;
 
 	if (wp == NULL)
 		return (NULL);
 	w = wp->window;
-	status = options_get_number(w->options, "pane-border-status");
+	status = window_get_pane_status(w);
 
 	list = NULL;
 	size = 0;
@@ -1406,25 +1574,25 @@ window_pane_find_up(struct window_pane *wp)
 	edge = yoff;
 	if (status == PANE_STATUS_TOP) {
 		if (edge == 1)
-			edge = w->sy + 1;
+			edge = (int)w->sy + 1;
 	} else if (status == PANE_STATUS_BOTTOM) {
 		if (edge == 0)
-			edge = w->sy;
+			edge = (int)w->sy;
 	} else {
 		if (edge == 0)
-			edge = w->sy + 1;
+			edge = (int)w->sy + 1;
 	}
 
 	left = xoff;
-	right = xoff + sx;
+	right = xoff + (int)sx;
 
 	TAILQ_FOREACH(next, &w->panes, entry) {
 		window_pane_full_size_offset(next, &xoff, &yoff, &sx, &sy);
 		if (next == wp)
 			continue;
-		if (yoff + sy + 1 != edge)
+		if (yoff + (int)sy + 1 != edge)
 			continue;
-		end = xoff + sx - 1;
+		end = xoff + (int)sx - 1;
 
 		found = 0;
 		if (xoff < left && end > right)
@@ -1450,34 +1618,34 @@ window_pane_find_down(struct window_pane *wp)
 {
 	struct window		*w;
 	struct window_pane	*next, *best, **list;
-	u_int			 edge, left, right, end, size;
-	int			 status, found;
-	u_int			 xoff, yoff, sx, sy;
+	int			 edge, left, right, end, status, found;
+	int			 xoff, yoff;
+	u_int			 size, sx, sy;
 
 	if (wp == NULL)
 		return (NULL);
 	w = wp->window;
-	status = options_get_number(w->options, "pane-border-status");
+	status = window_get_pane_status(w);
 
 	list = NULL;
 	size = 0;
 
 	window_pane_full_size_offset(wp, &xoff, &yoff, &sx, &sy);
 
-	edge = yoff + sy + 1;
+	edge = yoff + (int)sy + 1;
 	if (status == PANE_STATUS_TOP) {
-		if (edge >= w->sy)
+		if (edge >= (int)w->sy)
 			edge = 1;
 	} else if (status == PANE_STATUS_BOTTOM) {
-		if (edge >= w->sy - 1)
+		if (edge >= (int)w->sy - 1)
 			edge = 0;
 	} else {
-		if (edge >= w->sy)
+		if (edge >= (int)w->sy)
 			edge = 0;
 	}
 
 	left = wp->xoff;
-	right = wp->xoff + wp->sx;
+	right = wp->xoff + (int)wp->sx;
 
 	TAILQ_FOREACH(next, &w->panes, entry) {
 		window_pane_full_size_offset(next, &xoff, &yoff, &sx, &sy);
@@ -1485,7 +1653,7 @@ window_pane_find_down(struct window_pane *wp)
 			continue;
 		if (yoff != edge)
 			continue;
-		end = xoff + sx - 1;
+		end = xoff + (int)sx - 1;
 
 		found = 0;
 		if (xoff < left && end > right)
@@ -1511,9 +1679,9 @@ window_pane_find_left(struct window_pane *wp)
 {
 	struct window		*w;
 	struct window_pane	*next, *best, **list;
-	u_int			 edge, top, bottom, end, size;
-	int			 found;
-	u_int			 xoff, yoff, sx, sy;
+	int			 edge, top, bottom, end, found;
+	int			 xoff, yoff;
+	u_int			 size, sx, sy;
 
 	if (wp == NULL)
 		return (NULL);
@@ -1526,18 +1694,18 @@ window_pane_find_left(struct window_pane *wp)
 
 	edge = xoff;
 	if (edge == 0)
-		edge = w->sx + 1;
+		edge = (int)w->sx + 1;
 
 	top = yoff;
-	bottom = yoff + sy;
+	bottom = yoff + (int)sy;
 
 	TAILQ_FOREACH(next, &w->panes, entry) {
 		window_pane_full_size_offset(next, &xoff, &yoff, &sx, &sy);
 		if (next == wp)
 			continue;
-		if (xoff + sx + 1 != edge)
+		if (xoff + (int)sx + 1 != edge)
 			continue;
-		end = yoff + sy - 1;
+		end = yoff + (int)sy - 1;
 
 		found = 0;
 		if (yoff < top && end > bottom)
@@ -1563,9 +1731,9 @@ window_pane_find_right(struct window_pane *wp)
 {
 	struct window		*w;
 	struct window_pane	*next, *best, **list;
-	u_int			 edge, top, bottom, end, size;
-	int			 found;
-	u_int			 xoff, yoff, sx, sy;
+	int			 edge, top, bottom, end, found;
+	int			 xoff, yoff;
+	u_int			 size, sx, sy;
 
 	if (wp == NULL)
 		return (NULL);
@@ -1576,12 +1744,12 @@ window_pane_find_right(struct window_pane *wp)
 
 	window_pane_full_size_offset(wp, &xoff, &yoff, &sx, &sy);
 
-	edge = xoff + sx + 1;
-	if (edge >= w->sx)
+	edge = xoff + (int)sx + 1;
+	if (edge >= (int)w->sx)
 		edge = 0;
 
 	top = wp->yoff;
-	bottom = wp->yoff + wp->sy;
+	bottom = wp->yoff + (int)wp->sy;
 
 	TAILQ_FOREACH(next, &w->panes, entry) {
 		window_pane_full_size_offset(next, &xoff, &yoff, &sx, &sy);
@@ -1589,7 +1757,7 @@ window_pane_find_right(struct window_pane *wp)
 			continue;
 		if (xoff != edge)
 			continue;
-		end = yoff + sy - 1;
+		end = yoff + (int)sy - 1;
 
 		found = 0;
 		if (yoff < top && end > bottom)
@@ -1609,6 +1777,7 @@ window_pane_find_right(struct window_pane *wp)
 	return (best);
 }
 
+/* Add window to stack. */
 void
 window_pane_stack_push(struct window_panes *stack, struct window_pane *wp)
 {
@@ -1619,6 +1788,7 @@ window_pane_stack_push(struct window_panes *stack, struct window_pane *wp)
 	}
 }
 
+/* Remove window from stack. */
 void
 window_pane_stack_remove(struct window_panes *stack, struct window_pane *wp)
 {
@@ -1968,4 +2138,82 @@ window_pane_send_theme_update(struct window_pane *wp)
 		log_debug("%s: %%%u unknown theme", __func__, wp->id);
 		break;
 	}
+}
+
+struct style_range *
+window_pane_status_get_range(struct window_pane *wp, u_int x, u_int y)
+{
+	struct style_ranges	*srs;
+	u_int			 line;
+	int			 pane_status;
+
+	if (wp == NULL)
+		return (NULL);
+	srs = &wp->border_status_line.ranges;
+
+	pane_status = window_pane_get_pane_status(wp);
+	if (pane_status == PANE_STATUS_TOP)
+		line = wp->yoff - 1;
+	else if (pane_status == PANE_STATUS_BOTTOM)
+		line = wp->yoff + wp->sy;
+	if (pane_status == PANE_STATUS_OFF || line != y)
+		return (NULL);
+
+	/*
+	 * The border formats start 2 off but that isn't reflected in
+	 * the stored bounds of the range.
+	 */
+	return (style_ranges_get_range(srs, x - wp->xoff - 2));
+}
+
+enum pane_lines
+window_pane_get_pane_lines(struct window_pane *wp)
+{
+	struct options	*oo;
+
+	if (!window_pane_is_floating(wp))
+		oo = wp->window->options;
+	else
+		oo = wp->options;
+	return (options_get_number(oo, "pane-border-lines"));
+}
+
+int
+window_get_pane_status(struct window *w)
+{
+	int	status;
+
+	status = options_get_number(w->options, "pane-border-status");
+	if (status == PANE_STATUS_TOP_FLOATING ||
+	    status == PANE_STATUS_BOTTOM_FLOATING)
+		return (PANE_STATUS_OFF);
+	return (status);
+}
+
+int
+window_pane_get_pane_status(struct window_pane *wp)
+{
+	int	status;
+
+	if (!window_pane_is_floating(wp))
+		return (window_get_pane_status(wp->window));
+	if (window_pane_get_pane_lines(wp) == PANE_LINES_NONE)
+		return (PANE_STATUS_OFF);
+
+	status = options_get_number(wp->options, "pane-border-status");
+	if (status == PANE_STATUS_TOP_FLOATING)
+		return (PANE_STATUS_TOP);
+	if (status == PANE_STATUS_BOTTOM_FLOATING)
+		return (PANE_STATUS_BOTTOM);
+	return (status);
+}
+
+int
+window_pane_is_floating(struct window_pane *wp)
+{
+	struct layout_cell	*lc = wp->layout_cell;
+
+	if (lc == NULL || (lc->flags & LAYOUT_CELL_FLOATING) == 0)
+		return (0);
+	return (1);
 }

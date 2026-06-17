@@ -84,6 +84,10 @@ static void	tty_write_one(void (*)(struct tty *, const struct tty_ctx *),
 #define TTY_QUERY_TIMEOUT 5
 #define TTY_REQUEST_LIMIT 30
 
+static struct tty_style_ctx tty_default_style_ctx = {
+	&grid_default_cell, NULL, NULL
+};
+
 void
 tty_create_log(void)
 {
@@ -108,6 +112,7 @@ tty_init(struct tty *tty, struct client *c)
 	tty->cstyle = SCREEN_CURSOR_DEFAULT;
 	tty->ccolour = -1;
 	tty->fg = tty->bg = -1;
+	tty->mouse_last_pane = -1;
 
 	if (tcgetattr(c->fd, &tty->tio) != 0)
 		return (-1);
@@ -1003,7 +1008,7 @@ tty_window_offset1(struct tty *tty, u_int *ox, u_int *oy, u_int *sx, u_int *sy)
 		else if (cy > w->sy - *sy)
 			*oy = w->sy - *sy;
 		else
-			*oy = cy - *sy / 2;
+			*oy = cy - *sy + 1;
 	}
 
 	c->pan_window = NULL;
@@ -1092,12 +1097,14 @@ tty_redraw_region(struct tty *tty, const struct tty_ctx *ctx)
 	 * If region is large, schedule a redraw. In most cases this is likely
 	 * to be followed by some more scrolling.
 	 */
-	if (tty_large_region(tty, ctx)) {
-		log_debug("%s: %s large redraw", __func__, c->name);
+	if (tty_large_region(tty, ctx) || ctx->flags & TTY_CTX_PANE_OBSCURED) {
+		log_debug("%s: %s large region redraw", __func__, c->name);
 		ctx->redraw_cb(ctx);
 		return;
 	}
 
+	log_debug("%s: %s small region redraw (%u-%u)", __func__, c->name,
+	    ctx->orupper, ctx->orlower);
 	for (i = ctx->orupper; i <= ctx->orlower; i++)
 		tty_draw_pane(tty, ctx, i);
 }
@@ -1109,7 +1116,7 @@ tty_is_visible(__unused struct tty *tty, const struct tty_ctx *ctx, u_int px,
 {
 	u_int	xoff = ctx->rxoff + px, yoff = ctx->ryoff + py;
 
-	if (!ctx->bigger)
+	if (~ctx->flags & TTY_CTX_WINDOW_BIGGER)
 		return (1);
 
 	if (xoff + nx <= ctx->wox || xoff >= ctx->wox + ctx->wsx ||
@@ -1123,23 +1130,34 @@ static int
 tty_clamp_line(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
     u_int nx, u_int *i, u_int *x, u_int *rx, u_int *ry)
 {
-	u_int	xoff = ctx->rxoff + px;
+	int	xoff = ctx->rxoff + px;
+
+	/*
+	 * px = x position in pane
+	 * py = y position in pane
+	 * nx = width
+	 *
+	 * i = new x position in pane
+	 * x = x position on terminal
+	 * rx = new width
+	 * ry = y position on terminal
+	 */
 
 	if (!tty_is_visible(tty, ctx, px, py, nx, 1))
 		return (0);
 	*ry = ctx->yoff + py - ctx->woy;
 
-	if (xoff >= ctx->wox && xoff + nx <= ctx->wox + ctx->wsx) {
+	if (xoff >= (int)ctx->wox && xoff + nx <= ctx->wox + ctx->wsx) {
 		/* All visible. */
 		*i = 0;
 		*x = ctx->xoff + px - ctx->wox;
 		*rx = nx;
-	} else if (xoff < ctx->wox && xoff + nx > ctx->wox + ctx->wsx) {
+	} else if (xoff < (int)ctx->wox && xoff + nx > ctx->wox + ctx->wsx) {
 		/* Both left and right not visible. */
 		*i = ctx->wox;
 		*x = 0;
 		*rx = ctx->wsx;
-	} else if (xoff < ctx->wox) {
+	} else if (xoff < (int)ctx->wox) {
 		/* Left not visible. */
 		*i = ctx->wox - (ctx->xoff + px);
 		*x = 0;
@@ -1162,6 +1180,9 @@ tty_clear_line(struct tty *tty, const struct grid_cell *defaults, u_int py,
     u_int px, u_int nx, u_int bg)
 {
 	struct client		*c = tty->client;
+	struct visible_ranges	*r;
+	struct visible_range	*rr;
+	u_int			 i;
 
 	log_debug("%s: %s, %u at %u,%u", __func__, c->name, nx, px, py);
 
@@ -1197,8 +1218,14 @@ tty_clear_line(struct tty *tty, const struct grid_cell *defaults, u_int py,
 	 * Couldn't use an escape sequence, use spaces. Clear only the visible
 	 * bit if there is an overlay.
 	 */
-	tty_cursor(tty, px, py);
-	tty_repeat_space(tty, nx);
+	r = tty_check_overlay_range(tty, px, py, nx);
+	for (i = 0; i < r->used; i++) {
+		rr = &r->ranges[i];
+		if (rr->nx != 0) {
+			tty_cursor(tty, rr->px, py);
+			tty_repeat_space(tty, rr->nx);
+		}
+	}
 }
 
 /* Clear a line, adjusting to visible part of pane. */
@@ -1206,13 +1233,23 @@ static void
 tty_clear_pane_line(struct tty *tty, const struct tty_ctx *ctx, u_int py,
     u_int px, u_int nx, u_int bg)
 {
-	struct client	*c = tty->client;
-	u_int		 i, x, rx, ry;
+	struct client		*c = tty->client;
+	struct visible_ranges	*r;
+	struct visible_range	*ri;
+	u_int			 i, l, x, rx, ry;
 
 	log_debug("%s: %s, %u at %u,%u", __func__, c->name, nx, px, py);
 
-	if (tty_clamp_line(tty, ctx, px, py, nx, &i, &x, &rx, &ry))
-		tty_clear_line(tty, &ctx->defaults, ry, x, rx, bg);
+	if (tty_clamp_line(tty, ctx, px, py, nx, &l, &x, &rx, &ry)) {
+		r = tty_check_overlay_range(tty, x, ry, rx);
+		for (i = 0; i < r->used; i++) {
+			ri = &r->ranges[i];
+			if (ri->nx == 0)
+				continue;
+			tty_clear_line(tty, &ctx->defaults, ry, ri->px, ri->nx,
+			    bg);
+		}
+	}
 }
 
 /* Clamp area position to visible part of pane. */
@@ -1279,12 +1316,13 @@ tty_clamp_area(struct tty *tty, const struct tty_ctx *ctx, u_int px, u_int py,
 
 /* Clear an area, adjusting to visible part of pane. */
 static void
-tty_clear_area(struct tty *tty, const struct grid_cell *defaults, u_int py,
+tty_clear_area(struct tty *tty, const struct tty_ctx *ctx, u_int py,
     u_int ny, u_int px, u_int nx, u_int bg)
 {
-	struct client	*c = tty->client;
-	u_int		 yy;
-	char		 tmp[64];
+	struct client		*c = tty->client;
+	const struct grid_cell	*defaults = &ctx->defaults;
+	u_int			 yy;
+	char			 tmp[64];
 
 	log_debug("%s: %s, %u,%u at %u,%u", __func__, c->name, nx, ny, px, py);
 
@@ -1292,7 +1330,10 @@ tty_clear_area(struct tty *tty, const struct grid_cell *defaults, u_int py,
 	if (nx == 0 || ny == 0)
 		return;
 
-	/* If genuine BCE is available, can try escape sequences. */
+	/*
+	 * If there is an overlay or BCE is not available, cannot clear as a
+	 * region.
+	 */
 	if (c->overlay_check == NULL && !tty_fake_bce(tty, defaults, bg)) {
 		/* Use ED if clearing off the bottom of the terminal. */
 		if (px == 0 &&
@@ -1357,28 +1398,64 @@ tty_clear_pane_area(struct tty *tty, const struct tty_ctx *ctx, u_int py,
 	u_int	i, j, x, y, rx, ry;
 
 	if (tty_clamp_area(tty, ctx, px, py, nx, ny, &i, &j, &x, &y, &rx, &ry))
-		tty_clear_area(tty, &ctx->defaults, y, ry, x, rx, bg);
+		tty_clear_area(tty, ctx, y, ry, x, rx, bg);
 }
 
+/* Redraw a line of a screen at py. */
 static void
 tty_draw_pane(struct tty *tty, const struct tty_ctx *ctx, u_int py)
 {
-	struct screen	*s = ctx->s;
-	u_int		 nx = ctx->sx, i, x, rx, ry;
+	struct screen		*s = ctx->s;
+	u_int			 nx = ctx->sx, i, x, rx, ry, j;
+	struct visible_ranges	*r;
+	struct visible_range	*rr;
 
-	log_debug("%s: %s %u %d", __func__, tty->client->name, py, ctx->bigger);
+	log_debug("%s: %s %u", __func__, tty->client->name, py);
 
-	if (!ctx->bigger) {
-		tty_draw_line(tty, s, 0, py, nx, ctx->xoff, ctx->yoff + py,
-		    &ctx->defaults, ctx->palette);
+	if (~ctx->flags & TTY_CTX_WINDOW_BIGGER) {
+		r = tty_check_overlay_range(tty, ctx->xoff, ctx->yoff + py, nx);
+		for (j = 0; j < r->used; j++) {
+			rr = &r->ranges[j];
+			if (rr->nx == 0)
+				continue;
+			tty_draw_line(tty, s, rr->px - ctx->xoff, py, rr->nx,
+			    rr->px, ctx->yoff + py, &ctx->style_ctx);
+		}
 		return;
 	}
 	if (tty_clamp_line(tty, ctx, 0, py, nx, &i, &x, &rx, &ry)) {
-		tty_draw_line(tty, s, i, py, rx, x, ry, &ctx->defaults,
-		    ctx->palette);
+		r = tty_check_overlay_range(tty, x, ry, rx);
+		for (j = 0; j < r->used; j++) {
+			rr = &r->ranges[j];
+			if (rr->nx == 0)
+				continue;
+			tty_draw_line(tty, s, i + rr->px - x, py, rr->nx,
+			    rr->px, ry, &ctx->style_ctx);
+		}
 	}
 }
 
+void
+tty_cmd_redrawline(struct tty *tty, const struct tty_ctx *ctx)
+{
+	u_int			 i, x, rx, ry, j;
+	struct visible_ranges	*r;
+	struct visible_range	*rr;
+
+	if (tty_clamp_line(tty, ctx, ctx->ocx, ctx->ocy, ctx->n,
+	    &i, &x, &rx, &ry)) {
+		r = tty_check_overlay_range(tty, x, ry, rx);
+		for (j = 0; j < r->used; j++) {
+			rr = &r->ranges[j];
+			if (rr->nx == 0)
+				continue;
+			tty_draw_line(tty, ctx->s, ctx->ocx + i + rr->px - x,
+			    ctx->ocy, rr->nx, rr->px, ry, &ctx->style_ctx);
+		}
+	}
+}
+
+/* Check if character needs to be mapped for codeset. */
 const struct grid_cell *
 tty_check_codeset(struct tty *tty, const struct grid_cell *gc)
 {
@@ -1454,9 +1531,11 @@ tty_set_client_cb(struct tty_ctx *ttyctx, struct client *c)
 	if (wp->layout_cell == NULL)
 		return (0);
 
-	/* Set the properties relevant to the current client. */
-	ttyctx->bigger = tty_window_offset(&c->tty, &ttyctx->wox, &ttyctx->woy,
-	    &ttyctx->wsx, &ttyctx->wsy);
+	if (tty_window_offset(&c->tty, &ttyctx->wox, &ttyctx->woy, &ttyctx->wsx,
+	    &ttyctx->wsy))
+		ttyctx->flags |= TTY_CTX_WINDOW_BIGGER;
+	else
+		ttyctx->flags &= ~TTY_CTX_WINDOW_BIGGER;
 
 	ttyctx->yoff = ttyctx->ryoff = wp->yoff;
 	if (status_at_line(c) == 0)
@@ -1485,10 +1564,10 @@ tty_draw_images(struct client *c, struct window_pane *wp, struct screen *s)
 		ttyctx.sx = wp->sx;
 		ttyctx.sy = wp->sy;
 
-		ttyctx.ptr = im;
+		ttyctx.image = im;
 		ttyctx.arg = wp;
 		ttyctx.set_client_cb = tty_set_client_cb;
-		ttyctx.allow_invisible_panes = 1;
+		ttyctx.flags |= TTY_CTX_INVISIBLE_PANES;
 		tty_write_one(tty_cmd_sixelimage, c, &ttyctx);
 	}
 }
@@ -1536,7 +1615,7 @@ tty_client_ready(const struct tty_ctx *ctx, struct client *c)
 	 * If invisible panes are allowed (used for passthrough), don't care if
 	 * redrawing or frozen.
 	 */
-	if (ctx->allow_invisible_panes)
+	if (ctx->flags & TTY_CTX_INVISIBLE_PANES)
 		return (1);
 
 	if (c->flags & CLIENT_REDRAWWINDOW)
@@ -1585,7 +1664,7 @@ tty_cmd_insertcharacter(struct tty *tty, const struct tty_ctx *ctx)
 {
 	struct client	*c = tty->client;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    !tty_full_width(tty, ctx) ||
 	    tty_fake_bce(tty, &ctx->defaults, ctx->bg) ||
 	    (!tty_term_has(tty->term, TTYC_ICH) &&
@@ -1595,12 +1674,11 @@ tty_cmd_insertcharacter(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_cursor_pane(tty, ctx, ctx->ocx, ctx->ocy);
 
-	tty_emulate_repeat(tty, TTYC_ICH, TTYC_ICH1, ctx->num);
+	tty_emulate_repeat(tty, TTYC_ICH, TTYC_ICH1, ctx->n);
 }
 
 void
@@ -1608,7 +1686,7 @@ tty_cmd_deletecharacter(struct tty *tty, const struct tty_ctx *ctx)
 {
 	struct client	*c = tty->client;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    !tty_full_width(tty, ctx) ||
 	    tty_fake_bce(tty, &ctx->defaults, ctx->bg) ||
 	    (!tty_term_has(tty->term, TTYC_DCH) &&
@@ -1618,21 +1696,19 @@ tty_cmd_deletecharacter(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_cursor_pane(tty, ctx, ctx->ocx, ctx->ocy);
 
-	tty_emulate_repeat(tty, TTYC_DCH, TTYC_DCH1, ctx->num);
+	tty_emulate_repeat(tty, TTYC_DCH, TTYC_DCH1, ctx->n);
 }
 
 void
 tty_cmd_clearcharacter(struct tty *tty, const struct tty_ctx *ctx)
 {
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
-	tty_clear_pane_line(tty, ctx, ctx->ocy, ctx->ocx, ctx->num, ctx->bg);
+	tty_clear_pane_line(tty, ctx, ctx->ocy, ctx->ocx, ctx->n, ctx->bg);
 }
 
 void
@@ -1640,7 +1716,7 @@ tty_cmd_insertline(struct tty *tty, const struct tty_ctx *ctx)
 {
 	struct client	*c = tty->client;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    !tty_full_width(tty, ctx) ||
 	    tty_fake_bce(tty, &ctx->defaults, ctx->bg) ||
 	    !tty_term_has(tty->term, TTYC_CSR) ||
@@ -1652,14 +1728,13 @@ tty_cmd_insertline(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, ctx->orupper, ctx->orlower);
 	tty_margin_off(tty);
 	tty_cursor_pane(tty, ctx, ctx->ocx, ctx->ocy);
 
-	tty_emulate_repeat(tty, TTYC_IL, TTYC_IL1, ctx->num);
+	tty_emulate_repeat(tty, TTYC_IL, TTYC_IL1, ctx->n);
 	tty->cx = tty->cy = UINT_MAX;
 }
 
@@ -1668,7 +1743,7 @@ tty_cmd_deleteline(struct tty *tty, const struct tty_ctx *ctx)
 {
 	struct client	*c = tty->client;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    !tty_full_width(tty, ctx) ||
 	    tty_fake_bce(tty, &ctx->defaults, ctx->bg) ||
 	    !tty_term_has(tty->term, TTYC_CSR) ||
@@ -1680,22 +1755,20 @@ tty_cmd_deleteline(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, ctx->orupper, ctx->orlower);
 	tty_margin_off(tty);
 	tty_cursor_pane(tty, ctx, ctx->ocx, ctx->ocy);
 
-	tty_emulate_repeat(tty, TTYC_DL, TTYC_DL1, ctx->num);
+	tty_emulate_repeat(tty, TTYC_DL, TTYC_DL1, ctx->n);
 	tty->cx = tty->cy = UINT_MAX;
 }
 
 void
 tty_cmd_clearline(struct tty *tty, const struct tty_ctx *ctx)
 {
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_clear_pane_line(tty, ctx, ctx->ocy, 0, ctx->sx, ctx->bg);
 }
@@ -1705,8 +1778,7 @@ tty_cmd_clearendofline(struct tty *tty, const struct tty_ctx *ctx)
 {
 	u_int	nx = ctx->sx - ctx->ocx;
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_clear_pane_line(tty, ctx, ctx->ocy, ctx->ocx, nx, ctx->bg);
 }
@@ -1714,8 +1786,7 @@ tty_cmd_clearendofline(struct tty *tty, const struct tty_ctx *ctx)
 void
 tty_cmd_clearstartofline(struct tty *tty, const struct tty_ctx *ctx)
 {
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_clear_pane_line(tty, ctx, ctx->ocy, 0, ctx->ocx + 1, ctx->bg);
 }
@@ -1728,7 +1799,7 @@ tty_cmd_reverseindex(struct tty *tty, const struct tty_ctx *ctx)
 	if (ctx->ocy != ctx->orupper)
 		return;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    (!tty_full_width(tty, ctx) && !tty_use_margin(tty)) ||
 	    tty_fake_bce(tty, &ctx->defaults, 8) ||
 	    !tty_term_has(tty->term, TTYC_CSR) ||
@@ -1741,8 +1812,7 @@ tty_cmd_reverseindex(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, ctx->orupper, ctx->orlower);
 	tty_margin_pane(tty, ctx);
@@ -1762,7 +1832,7 @@ tty_cmd_linefeed(struct tty *tty, const struct tty_ctx *ctx)
 	if (ctx->ocy != ctx->orlower)
 		return;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    (!tty_full_width(tty, ctx) && !tty_use_margin(tty)) ||
 	    tty_fake_bce(tty, &ctx->defaults, 8) ||
 	    !tty_term_has(tty->term, TTYC_CSR) ||
@@ -1773,8 +1843,7 @@ tty_cmd_linefeed(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, ctx->orupper, ctx->orlower);
 	tty_margin_pane(tty, ctx);
@@ -1800,10 +1869,10 @@ tty_cmd_linefeed(struct tty *tty, const struct tty_ctx *ctx)
 void
 tty_cmd_scrollup(struct tty *tty, const struct tty_ctx *ctx)
 {
-	struct client	*c = tty->client;
-	u_int		 i;
+	struct client		*c = tty->client;
+	u_int			 i;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    (!tty_full_width(tty, ctx) && !tty_use_margin(tty)) ||
 	    tty_fake_bce(tty, &ctx->defaults, 8) ||
 	    !tty_term_has(tty->term, TTYC_CSR) ||
@@ -1814,25 +1883,24 @@ tty_cmd_scrollup(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, ctx->orupper, ctx->orlower);
 	tty_margin_pane(tty, ctx);
 
-	if (ctx->num == 1 || !tty_term_has(tty->term, TTYC_INDN)) {
+	if (ctx->n == 1 || !tty_term_has(tty->term, TTYC_INDN)) {
 		if (!tty_use_margin(tty))
 			tty_cursor(tty, 0, tty->rlower);
 		else
 			tty_cursor(tty, tty->rright, tty->rlower);
-		for (i = 0; i < ctx->num; i++)
+		for (i = 0; i < ctx->n; i++)
 			tty_putc(tty, '\n');
 	} else {
 		if (tty->cy == UINT_MAX)
 			tty_cursor(tty, 0, 0);
 		else
 			tty_cursor(tty, 0, tty->cy);
-		tty_putcode_i(tty, TTYC_INDN, ctx->num);
+		tty_putcode_i(tty, TTYC_INDN, ctx->n);
 	}
 }
 
@@ -1842,7 +1910,7 @@ tty_cmd_scrolldown(struct tty *tty, const struct tty_ctx *ctx)
 	u_int		 i;
 	struct client	*c = tty->client;
 
-	if (ctx->bigger ||
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
 	    (!tty_full_width(tty, ctx) && !tty_use_margin(tty)) ||
 	    tty_fake_bce(tty, &ctx->defaults, 8) ||
 	    !tty_term_has(tty->term, TTYC_CSR) ||
@@ -1855,17 +1923,16 @@ tty_cmd_scrolldown(struct tty *tty, const struct tty_ctx *ctx)
 		return;
 	}
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, ctx->orupper, ctx->orlower);
 	tty_margin_pane(tty, ctx);
 	tty_cursor_pane(tty, ctx, ctx->ocx, ctx->orupper);
 
 	if (tty_term_has(tty->term, TTYC_RIN))
-		tty_putcode_i(tty, TTYC_RIN, ctx->num);
+		tty_putcode_i(tty, TTYC_RIN, ctx->n);
 	else {
-		for (i = 0; i < ctx->num; i++)
+		for (i = 0; i < ctx->n; i++)
 			tty_putcode(tty, TTYC_RI);
 	}
 }
@@ -1875,8 +1942,7 @@ tty_cmd_clearendofscreen(struct tty *tty, const struct tty_ctx *ctx)
 {
 	u_int	px, py, nx, ny;
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, 0, ctx->sy - 1);
 	tty_margin_off(tty);
@@ -1900,8 +1966,7 @@ tty_cmd_clearstartofscreen(struct tty *tty, const struct tty_ctx *ctx)
 {
 	u_int	px, py, nx, ny;
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, 0, ctx->sy - 1);
 	tty_margin_off(tty);
@@ -1925,8 +1990,7 @@ tty_cmd_clearscreen(struct tty *tty, const struct tty_ctx *ctx)
 {
 	u_int	px, py, nx, ny;
 
-	tty_default_attributes(tty, &ctx->defaults, ctx->palette, ctx->bg,
-	    ctx->s->hyperlinks);
+	tty_default_attributes(tty, ctx->bg, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, 0, ctx->sy - 1);
 	tty_margin_off(tty);
@@ -1942,15 +2006,16 @@ tty_cmd_clearscreen(struct tty *tty, const struct tty_ctx *ctx)
 void
 tty_cmd_alignmenttest(struct tty *tty, const struct tty_ctx *ctx)
 {
-	u_int	i, j;
+	struct client	*c = tty->client;
+	u_int		 i, j;
 
-	if (ctx->bigger) {
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) ||
+	    c->overlay_check != NULL) {
 		ctx->redraw_cb(ctx);
 		return;
 	}
 
-	tty_attributes(tty, &grid_default_cell, &ctx->defaults, ctx->palette,
-	    ctx->s->hyperlinks);
+	tty_attributes(tty, &grid_default_cell, &ctx->style_ctx);
 
 	tty_region_pane(tty, ctx, 0, ctx->sy - 1);
 	tty_margin_off(tty);
@@ -1972,24 +2037,18 @@ tty_cmd_cell(struct tty *tty, const struct tty_ctx *ctx)
 
 	px = ctx->xoff + ctx->ocx - ctx->wox;
 	py = ctx->yoff + ctx->ocy - ctx->woy;
-	if (!tty_is_visible(tty, ctx, ctx->ocx, ctx->ocy, 1, 1) ||
-	    (gcp->data.width == 1 && !tty_check_overlay(tty, px, py)))
+	if (!tty_is_visible(tty, ctx, ctx->ocx, ctx->ocy, 1, 1))
 		return;
 
-	if (ctx->num == 2) {
-		tty_draw_line(tty, s, 0, s->cy, screen_size_x(s),
-		    ctx->xoff - ctx->wox, py, &ctx->defaults, ctx->palette);
+	if (gcp->data.width == 1 && !tty_check_overlay(tty, px, py))
 		return;
-	}
-
-	/* Handle partially obstructed wide characters. */
-	if (gcp->data.width > 1) {
+	if (gcp->data.width > 1) { /* could be partially obscured */
 		r = tty_check_overlay_range(tty, px, py, gcp->data.width);
 		for (i = 0; i < r->used; i++)
 			vis += r->ranges[i].nx;
 		if (vis < gcp->data.width) {
 			tty_draw_line(tty, s, s->cx, s->cy, gcp->data.width,
-			    px, py, &ctx->defaults, ctx->palette);
+			    px, py, &ctx->style_ctx);
 			return;
 		}
 	}
@@ -2000,12 +2059,13 @@ tty_cmd_cell(struct tty *tty, const struct tty_ctx *ctx)
 		tty_region_pane(tty, ctx, ctx->orupper, ctx->orlower);
 
 	tty_margin_off(tty);
+	if (ctx->flags & TTY_CTX_CELL_INVALIDATE)
+		tty_invalidate(tty);
 	tty_cursor_pane_unless_wrap(tty, ctx, ctx->ocx, ctx->ocy);
 
-	tty_cell(tty, ctx->cell, &ctx->defaults, ctx->palette,
-	    ctx->s->hyperlinks);
+	tty_cell(tty, ctx->cell, &ctx->style_ctx);
 
-	if (ctx->num == 1)
+	if (ctx->flags & TTY_CTX_CELL_INVALIDATE)
 		tty_invalidate(tty);
 }
 
@@ -2013,17 +2073,18 @@ void
 tty_cmd_cells(struct tty *tty, const struct tty_ctx *ctx)
 {
 	struct visible_ranges	*r;
-	struct visible_range	*rr;
+	struct visible_range	*ri;
 	u_int			 i, px, py, cx;
-	char			*cp = ctx->ptr;
+	const char		*cp = ctx->data.data;
+	size_t			 n = ctx->data.size;
 
-	if (!tty_is_visible(tty, ctx, ctx->ocx, ctx->ocy, ctx->num, 1))
+	if (!tty_is_visible(tty, ctx, ctx->ocx, ctx->ocy, n, 1))
 		return;
 
-	if (ctx->bigger &&
+	if ((ctx->flags & TTY_CTX_WINDOW_BIGGER) &&
 	    (ctx->xoff + ctx->ocx < ctx->wox ||
-	    ctx->xoff + ctx->ocx + ctx->num > ctx->wox + ctx->wsx)) {
-		if (!ctx->wrapped ||
+	    ctx->xoff + ctx->ocx + n > ctx->wox + ctx->wsx)) {
+		if ((~ctx->flags & TTY_CTX_WRAPPED) ||
 		    !tty_full_width(tty, ctx) ||
 		    (tty->term->flags & TERM_NOAM) ||
 		    ctx->xoff + ctx->ocx != 0 ||
@@ -2038,20 +2099,19 @@ tty_cmd_cells(struct tty *tty, const struct tty_ctx *ctx)
 
 	tty_margin_off(tty);
 	tty_cursor_pane_unless_wrap(tty, ctx, ctx->ocx, ctx->ocy);
-	tty_attributes(tty, ctx->cell, &ctx->defaults, ctx->palette,
-	    ctx->s->hyperlinks);
+	tty_attributes(tty, ctx->cell, &ctx->style_ctx);
 
 	/* Get tty position from pane position for overlay check. */
 	px = ctx->xoff + ctx->ocx - ctx->wox;
 	py = ctx->yoff + ctx->ocy - ctx->woy;
 
-	r = tty_check_overlay_range(tty, px, py, ctx->num);
+	r = tty_check_overlay_range(tty, px, py, n);
 	for (i = 0; i < r->used; i++) {
-		rr = &r->ranges[i];
-		if (rr->nx != 0) {
-			cx = rr->px - ctx->xoff + ctx->wox;
+		ri = &r->ranges[i];
+		if (ri->nx != 0) {
+			cx = ri->px - ctx->xoff + ctx->wox;
 			tty_cursor_pane_unless_wrap(tty, ctx, cx, ctx->ocy);
-			tty_putn(tty, cp + rr->px - px, rr->nx, rr->nx);
+			tty_putn(tty, cp + ri->px - px, ri->nx, ri->nx);
 		}
 	}
 }
@@ -2059,7 +2119,7 @@ tty_cmd_cells(struct tty *tty, const struct tty_ctx *ctx)
 void
 tty_cmd_setselection(struct tty *tty, const struct tty_ctx *ctx)
 {
-	tty_set_selection(tty, ctx->ptr2, ctx->ptr, ctx->num);
+	tty_set_selection(tty, ctx->sel.clip, ctx->sel.data, ctx->sel.size);
 }
 
 void
@@ -2088,7 +2148,7 @@ void
 tty_cmd_rawstring(struct tty *tty, const struct tty_ctx *ctx)
 {
 	tty->flags |= TTY_NOBLOCK;
-	tty_add(tty, ctx->ptr, ctx->num);
+	tty_add(tty, ctx->data.data, ctx->data.size);
 	tty_invalidate(tty);
 }
 
@@ -2096,7 +2156,7 @@ tty_cmd_rawstring(struct tty *tty, const struct tty_ctx *ctx)
 void
 tty_cmd_sixelimage(struct tty *tty, const struct tty_ctx *ctx)
 {
-	struct image		*im = ctx->ptr;
+	struct image		*im = ctx->image;
 	struct sixel_image	*si = im->data;
 	struct sixel_image	*new;
 	char			*data;
@@ -2147,26 +2207,28 @@ tty_cmd_sixelimage(struct tty *tty, const struct tty_ctx *ctx)
 void
 tty_cmd_syncstart(struct tty *tty, const struct tty_ctx *ctx)
 {
-	if (ctx->num == 0x11) {
+	struct client	*c = tty->client;
+
+	if ((ctx->flags & TTY_CTX_OVERLAY_SYNC) &&
+	    (ctx->flags & TTY_CTX_SYNC)) {
 		/*
 		 * This is an overlay and a command that moves the cursor so
 		 * start synchronized updates.
 		 */
 		tty_sync_start(tty);
-	} else if (~ctx->num & 0x10) {
+	} else if (~ctx->flags & TTY_CTX_OVERLAY_SYNC) {
 		/*
 		 * This is a pane. If there is an overlay, always start;
 		 * otherwise, only if requested.
 		 */
-		if (ctx->num || tty->client->overlay_draw != NULL)
+		if ((ctx->flags & TTY_CTX_SYNC) || c->overlay_draw != NULL)
 			tty_sync_start(tty);
 	}
 }
 
 void
 tty_cell(struct tty *tty, const struct grid_cell *gc,
-    const struct grid_cell *defaults, struct colour_palette *palette,
-    struct hyperlinks *hl)
+    const struct tty_style_ctx *style_ctx)
 {
 	const struct grid_cell	*gcp;
 
@@ -2180,9 +2242,13 @@ tty_cell(struct tty *tty, const struct grid_cell *gc,
 	if (gc->flags & GRID_FLAG_PADDING)
 		return;
 
+	/* Check if character is covered by overlay or floating pane. */
+	if (!tty_check_overlay(tty, tty->cx, tty->cy))
+		return;
+
 	/* Check the output codeset and apply attributes. */
 	gcp = tty_check_codeset(tty, gc);
-	tty_attributes(tty, gcp, defaults, palette, hl);
+	tty_attributes(tty, gcp, style_ctx);
 
 	/* If it is a single character, write with putc to handle ACS. */
 	if (gcp->data.size == 1) {
@@ -2293,8 +2359,21 @@ tty_margin_off(struct tty *tty)
 static void
 tty_margin_pane(struct tty *tty, const struct tty_ctx *ctx)
 {
-	tty_margin(tty, ctx->xoff - ctx->wox,
-	    ctx->xoff + ctx->sx - 1 - ctx->wox);
+	int	l, r;
+
+	l = ctx->xoff - ctx->wox;
+	r = ctx->xoff + ctx->sx - 1 - ctx->wox;
+
+	if (l < 0)
+		l = 0;
+	if (l > (int)ctx->wsx)
+		l = ctx->wsx;
+	if (r < 0)
+		r = 0;
+	if (r > (int)ctx->wsx)
+		r = ctx->wsx;
+
+	tty_margin(tty, l, r);
 }
 
 /* Set margin at absolute position. */
@@ -2326,7 +2405,7 @@ static void
 tty_cursor_pane_unless_wrap(struct tty *tty, const struct tty_ctx *ctx,
     u_int cx, u_int cy)
 {
-	if (!ctx->wrapped ||
+	if ((~ctx->flags & TTY_CTX_WRAPPED) ||
 	    !tty_full_width(tty, ctx) ||
 	    (tty->term->flags & TERM_NOAM) ||
 	    ctx->xoff + cx != 0 ||
@@ -2514,19 +2593,22 @@ tty_hyperlink(struct tty *tty, const struct grid_cell *gc,
 
 void
 tty_attributes(struct tty *tty, const struct grid_cell *gc,
-    const struct grid_cell *defaults, struct colour_palette *palette,
-    struct hyperlinks *hl)
+    const struct tty_style_ctx *style_ctx)
 {
 	struct grid_cell	*tc = &tty->cell, gc2;
 	int			 changed;
+
+	/* Use default style if not given. */
+	if (style_ctx == NULL)
+		style_ctx = &tty_default_style_ctx;
 
 	/* Copy cell and update default colours. */
 	memcpy(&gc2, gc, sizeof gc2);
 	if (~gc->flags & GRID_FLAG_NOPALETTE) {
 		if (gc2.fg == 8)
-			gc2.fg = defaults->fg;
+			gc2.fg = style_ctx->defaults->fg;
 		if (gc2.bg == 8)
-			gc2.bg = defaults->bg;
+			gc2.bg = style_ctx->defaults->bg;
 	}
 
 	/* Ignore cell if it is the same as the last one. */
@@ -2553,9 +2635,9 @@ tty_attributes(struct tty *tty, const struct grid_cell *gc,
 	}
 
 	/* Fix up the colours if necessary. */
-	tty_check_fg(tty, palette, &gc2);
-	tty_check_bg(tty, palette, &gc2);
-	tty_check_us(tty, palette, &gc2);
+	tty_check_fg(tty, style_ctx->palette, &gc2);
+	tty_check_bg(tty, style_ctx->palette, &gc2);
+	tty_check_us(tty, style_ctx->palette, &gc2);
 
 	/*
 	 * If any bits are being cleared or the underline colour is now default,
@@ -2611,7 +2693,7 @@ tty_attributes(struct tty *tty, const struct grid_cell *gc,
 		tty_putcode(tty, TTYC_SMACS);
 
 	/* Set hyperlink if any. */
-	tty_hyperlink(tty, gc, hl);
+	tty_hyperlink(tty, gc, style_ctx->hyperlinks);
 
 	memcpy(&tty->last_cell, &gc2, sizeof tty->last_cell);
 }
@@ -2633,8 +2715,9 @@ tty_colours(struct tty *tty, const struct grid_cell *gc)
 	 */
 	if (COLOUR_DEFAULT(gc->fg) || COLOUR_DEFAULT(gc->bg)) {
 		/*
-		 * If don't have AX, send sgr0. This resets both colours to default.
-		 * Otherwise, try to set the default colour only as needed.
+		 * If don't have AX, send sgr0. This resets both colours to
+		 * default. Otherwise, try to set the default colour only as
+		 * needed.
 		 */
 		if (!tty_term_flag(tty->term, TTYC_AX))
 			tty_reset(tty);
@@ -2961,52 +3044,53 @@ tty_window_default_style(struct grid_cell *gc, struct window_pane *wp)
 	gc->bg = wp->palette.bg;
 }
 
-void
-tty_default_colours(struct grid_cell *gc, struct window_pane *wp)
+static void
+tty_style_changed(struct window_pane *wp)
 {
 	struct options		*oo = wp->options;
 	struct format_tree	*ft;
 
-	memcpy(gc, &grid_default_cell, sizeof *gc);
+	log_debug("%%%u: style changed", wp->id);
+	wp->flags &= ~PANE_STYLECHANGED;
 
-	if (wp->flags & PANE_STYLECHANGED) {
-		log_debug("%%%u: style changed", wp->id);
-		wp->flags &= ~PANE_STYLECHANGED;
+	ft = format_create(NULL, NULL, FORMAT_PANE|wp->id, FORMAT_NOJOBS);
+	format_defaults(ft, NULL, NULL, NULL, wp);
 
-		ft = format_create(NULL, NULL, FORMAT_PANE|wp->id,
-		    FORMAT_NOJOBS);
-		format_defaults(ft, NULL, NULL, NULL, wp);
-		tty_window_default_style(&wp->cached_active_gc, wp);
-		style_add(&wp->cached_active_gc, oo, "window-active-style", ft);
-		tty_window_default_style(&wp->cached_gc, wp);
-		style_add(&wp->cached_gc, oo, "window-style", ft);
-		format_free(ft);
-	}
+	tty_window_default_style(&wp->cached_active_gc, wp);
+	style_add(&wp->cached_active_gc, oo, "window-active-style", ft);
 
-	if (gc->fg == 8) {
-		if (wp == wp->window->active && wp->cached_active_gc.fg != 8)
-			gc->fg = wp->cached_active_gc.fg;
-		else
-			gc->fg = wp->cached_gc.fg;
-	}
+	tty_window_default_style(&wp->cached_gc, wp);
+	style_add(&wp->cached_gc, oo, "window-style", ft);
 
-	if (gc->bg == 8) {
-		if (wp == wp->window->active && wp->cached_active_gc.bg != 8)
-			gc->bg = wp->cached_active_gc.bg;
-		else
-			gc->bg = wp->cached_gc.bg;
-	}
+	format_free(ft);
 }
 
 void
-tty_default_attributes(struct tty *tty, const struct grid_cell *defaults,
-    struct colour_palette *palette, u_int bg, struct hyperlinks *hl)
+tty_default_colours(struct grid_cell *gc, struct window_pane *wp)
+{
+	if (wp->flags & PANE_STYLECHANGED)
+		tty_style_changed (wp);
+
+	memcpy(gc, &grid_default_cell, sizeof *gc);
+	if (wp == wp->window->active && wp->cached_active_gc.fg != 8)
+		gc->fg = wp->cached_active_gc.fg;
+	else
+		gc->fg = wp->cached_gc.fg;
+	if (wp == wp->window->active && wp->cached_active_gc.bg != 8)
+		gc->bg = wp->cached_active_gc.bg;
+	else
+		gc->bg = wp->cached_gc.bg;
+}
+
+void
+tty_default_attributes(struct tty *tty, u_int bg,
+    const struct tty_style_ctx *style_ctx)
 {
 	struct grid_cell	gc;
 
 	memcpy(&gc, &grid_default_cell, sizeof gc);
 	gc.bg = bg;
-	tty_attributes(tty, &gc, defaults, palette, hl);
+	tty_attributes(tty, &gc, style_ctx);
 }
 
 static void
@@ -3027,4 +3111,11 @@ tty_clipboard_query(struct tty *tty)
 		tty->flags |= TTY_OSC52QUERY;
 		evtimer_add(&tty->clipboard_timer, &tv);
 	}
+}
+
+void
+tty_set_progress_bar(struct tty *tty, struct progress_bar *pb)
+{
+	if (tty_term_has(tty->term, TTYC_SPB))
+		tty_putcode_ii(tty, TTYC_SPB, pb->state, pb->progress);
 }

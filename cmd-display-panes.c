@@ -56,6 +56,62 @@ cmd_display_panes_args_parse(__unused struct args *args, __unused u_int idx,
 }
 
 static void
+cmd_display_panes_put(struct screen_redraw_ctx *ctx,
+    struct window_pane *wp, u_int cx, u_int cy, const char *buf, size_t len)
+{
+	struct client		*c = ctx->c;
+	struct tty		*tty = &c->tty;
+	struct visible_ranges	*r;
+	struct visible_range	*ri;
+	u_int			 i, j;
+
+	r = window_visible_ranges(wp, ctx->ox + cx, ctx->oy + cy, len, NULL);
+	for (i = 0; i < r->used; i++) {
+		ri = &r->ranges[i];
+		for (j = ri->px; j < ri->px + ri->nx; j++) {
+			tty_cursor(tty, j - ctx->ox, cy);
+			tty_putn(tty, &buf[j - ri->px], 1, 1);
+		}
+	}
+}
+
+static void
+cmd_display_panes_draw_format(struct screen_redraw_ctx *ctx,
+    struct window_pane *wp, u_int xoff, u_int yoff, u_int sx,
+    const struct grid_cell *gc)
+{
+	struct client		*c = ctx->c;
+	struct tty		*tty = &c->tty;
+	struct session		*s = c->session;
+	struct screen		*sc = wp->screen, screen;
+	struct screen_write_ctx	 sctx;
+	struct visible_ranges	*r;
+	struct visible_range	*ri;
+	const char		*format;
+	char			*expanded;
+	u_int			 i, px = ctx->ox + xoff;
+
+	format = options_get_string(s->options, "display-panes-format");
+	expanded = format_single(NULL, format, c, s, s->curw, wp);
+
+	screen_init(&screen, sx, 1, 0);
+	screen_write_start(&sctx, &screen);
+	screen_write_fast_copy(&sctx, sc, 0, sc->grid->hsize, sx, 1);
+	screen_write_cursormove(&sctx, 0, 0, 0);
+	format_draw(&sctx, gc, sx, expanded, NULL, 0);
+	screen_write_stop(&sctx);
+	free(expanded);
+
+	r = window_visible_ranges(wp, px, wp->yoff, sx, NULL);
+	for (i = 0; i < r->used; i++) {
+		ri = &r->ranges[i];
+		tty_draw_line(tty, &screen, ri->px - px, 0, ri->nx,
+		    ri->px - ctx->ox, yoff, NULL);
+	}
+	screen_free(&screen);
+}
+
+static void
 cmd_display_panes_draw_pane(struct screen_redraw_ctx *ctx,
     struct window_pane *wp)
 {
@@ -66,14 +122,15 @@ cmd_display_panes_draw_pane(struct screen_redraw_ctx *ctx,
 	struct window		*w = wp->window;
 	struct grid_cell	 fgc, bgc;
 	u_int			 pane, idx, px, py, i, j, xoff, yoff, sx, sy;
+	u_int			 cx, cy;
 	int			 colour, active_colour;
-	char			 buf[16], lbuf[16], rbuf[16], *ptr;
-	size_t			 len, llen, rlen;
+	char			 buf[16], lbuf[16], *ptr;
+	size_t			 len, llen;
 
-	if (wp->xoff + wp->sx <= ctx->ox ||
-	    wp->xoff >= ctx->ox + ctx->sx ||
-	    wp->yoff + wp->sy <= ctx->oy ||
-	    wp->yoff >= ctx->oy + ctx->sy)
+	if (wp->xoff + (int)wp->sx <= ctx->ox ||
+	    wp->xoff >= ctx->ox + (int)ctx->sx ||
+	    wp->yoff + (int)wp->sy <= ctx->oy ||
+	    wp->yoff >= ctx->oy + (int)ctx->sy)
 		return;
 
 	if (wp->xoff >= ctx->ox && wp->xoff + wp->sx <= ctx->ox + ctx->sx) {
@@ -137,23 +194,26 @@ cmd_display_panes_draw_pane(struct screen_redraw_ctx *ctx,
 		bgc.bg = colour;
 	}
 
-	rlen = xsnprintf(rbuf, sizeof rbuf, "%ux%u", wp->sx, wp->sy);
 	if (pane > 9 && pane < 35)
 		llen = xsnprintf(lbuf, sizeof lbuf, "%c", 'a' + (pane - 10));
 	else
 		llen = 0;
 
 	if (sx < len * 6 || sy < 5) {
-		tty_attributes(tty, &fgc, &grid_default_cell, NULL, NULL);
+		tty_attributes(tty, &fgc, NULL);
 		if (sx >= len + llen + 1) {
 			len += llen + 1;
-			tty_cursor(tty, xoff + px - len / 2, yoff + py);
-			tty_putn(tty, buf, len,	 len);
-			tty_putn(tty, " ", 1, 1);
-			tty_putn(tty, lbuf, llen, llen);
+			cx = xoff + px - len / 2;
+			cy = yoff + py;
+			cmd_display_panes_put(ctx, wp, cx, cy, buf, len);
+			cx += len;
+			cmd_display_panes_put(ctx, wp, cx, cy, " ", 1);
+			cx++;
+			cmd_display_panes_put(ctx, wp, cx, cy, lbuf, llen);
 		} else {
-			tty_cursor(tty, xoff + px - len / 2, yoff + py);
-			tty_putn(tty, buf, len, len);
+			cx = xoff + px - len / 2;
+			cy = yoff + py;
+			cmd_display_panes_put(ctx, wp, cx, cy, buf, len);
 		}
 		goto out;
 	}
@@ -161,7 +221,7 @@ cmd_display_panes_draw_pane(struct screen_redraw_ctx *ctx,
 	px -= len * 3;
 	py -= 2;
 
-	tty_attributes(tty, &bgc, &grid_default_cell, NULL, NULL);
+	tty_attributes(tty, &bgc, NULL);
 	for (ptr = buf; *ptr != '\0'; ptr++) {
 		if (*ptr < '0' || *ptr > '9')
 			continue;
@@ -169,9 +229,11 @@ cmd_display_panes_draw_pane(struct screen_redraw_ctx *ctx,
 
 		for (j = 0; j < 5; j++) {
 			for (i = px; i < px + 5; i++) {
-				tty_cursor(tty, xoff + i, yoff + py + j);
-				if (window_clock_table[idx][j][i - px])
-					tty_putc(tty, ' ');
+				if (!window_clock_table[idx][j][i - px])
+					continue;
+				cx = xoff + i;
+				cy = yoff + py + j;
+				cmd_display_panes_put(ctx, wp, cx, cy, " ", 1);
 			}
 		}
 		px += 6;
@@ -179,15 +241,12 @@ cmd_display_panes_draw_pane(struct screen_redraw_ctx *ctx,
 
 	if (sy <= 6)
 		goto out;
-	tty_attributes(tty, &fgc, &grid_default_cell, NULL, NULL);
-	if (rlen != 0 && sx >= rlen) {
-		tty_cursor(tty, xoff + sx - rlen, yoff);
-		tty_putn(tty, rbuf, rlen, rlen);
-	}
+	cmd_display_panes_draw_format(ctx, wp, xoff, yoff, sx, &fgc);
 	if (llen != 0) {
-		tty_cursor(tty, xoff + sx / 2 + len * 3 - llen - 1,
-		    yoff + py + 5);
-		tty_putn(tty, lbuf, llen, llen);
+		tty_attributes(tty, &fgc, NULL);
+		cx = xoff + sx / 2 + len * 3 - llen - 1;
+		cy = yoff + py + 5;
+		cmd_display_panes_put(ctx, wp, cx, cy, lbuf, llen);
 	}
 
 out:
@@ -204,7 +263,7 @@ cmd_display_panes_draw(struct client *c, __unused void *data,
 	log_debug("%s: %s @%u", __func__, c->name, w->id);
 
 	TAILQ_FOREACH(wp, &w->panes, entry) {
-		if (window_pane_visible(wp))
+		if (window_pane_is_visible(wp))
 			cmd_display_panes_draw_pane(ctx, wp);
 	}
 }

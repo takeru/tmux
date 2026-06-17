@@ -281,10 +281,8 @@ menu_draw_cb(struct client *c, void *data,
 	    &md->style_gc, &md->border_style_gc, &md->selected_style_gc);
 	screen_write_stop(&ctx);
 
-	for (i = 0; i < screen_size_y(&md->s); i++) {
-		tty_draw_line(tty, s, 0, i, menu->width + 4, px, py + i,
-		    &grid_default_cell, NULL);
-	}
+	for (i = 0; i < screen_size_y(&md->s); i++)
+		tty_draw_line(tty, s, 0, i, menu->width + 4, px, py + i, NULL);
 }
 
 void
@@ -363,7 +361,7 @@ menu_key_cb(struct client *c, void *data, struct key_event *event)
 		name = menu->items[i].name;
 		if (name == NULL || *name == '-')
 			continue;
-		if (event->key == menu->items[i].key) {
+		if ((event->key & ~KEYC_MASK_FLAGS) == menu->items[i].key) {
 			md->choice = i;
 			goto chosen;
 		}
@@ -471,6 +469,7 @@ menu_key_cb(struct client *c, void *data, struct key_event *event)
 	case '\r':
 		goto chosen;
 	case '\033': /* Escape */
+	case '['|KEYC_CTRL:
 	case 'c'|KEYC_CTRL:
 	case 'g'|KEYC_CTRL:
 	case 'q':

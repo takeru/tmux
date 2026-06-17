@@ -29,7 +29,8 @@
 	" 'Previous' 'p' {switch-client -p}" \
 	" ''" \
 	" 'Renumber' 'N' {move-window -r}" \
-	" 'Rename' 'n' {command-prompt -I \"#S\" {rename-session -- '%%'}}" \
+	" 'Rename' 'r' {command-prompt -I \"#S\" {rename-session -- '%%'}}" \
+	" 'Detach' 'd' {detach-client}" \
 	" ''" \
 	" 'New Session' 's' {new-session}" \
 	" 'New Window' 'w' {new-window}"
@@ -59,12 +60,12 @@
 	" '#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}' 'C-h' {copy-mode -q; send-keys -l -- \"#{q:mouse_hyperlink}\"}" \
 	" '#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}' 'h' {copy-mode -q; set-buffer -- \"#{q:mouse_hyperlink}\"}" \
 	" ''" \
-	" 'Horizontal Split' 'h' {split-window -h}" \
-	" 'Vertical Split' 'v' {split-window -v}" \
+	" '#{?#{!:#{pane_floating_flag}},Horizontal Split,}' 'h' {split-window -h}" \
+	" '#{?#{!:#{pane_floating_flag}},Vertical Split,}' 'v' {split-window -v}" \
 	" ''" \
-	" '#{?#{>:#{window_panes},1},,-}Swap Up' 'u' {swap-pane -U}" \
-	" '#{?#{>:#{window_panes},1},,-}Swap Down' 'd' {swap-pane -D}" \
-	" '#{?pane_marked_set,,-}Swap Marked' 's' {swap-pane}" \
+	" '#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Up,}' 'u' {swap-pane -U}" \
+	" '#{?#{&&:#{!:#{pane_floating_flag}},#{>:#{window_panes},1}},Swap Down,}' 'd' {swap-pane -D}" \
+	" '#{?#{!:#{pane_floating_flag}},#{?pane_marked_set,,-}Swap Marked,}' 's' {swap-pane}" \
 	" ''" \
 	" 'Kill' 'X' {kill-pane}" \
 	" 'Respawn' 'R' {respawn-pane -k}" \
@@ -361,6 +362,7 @@ key_bindings_init(void)
 		"bind -N 'Split window horizontally' % { split-window -h }",
 		"bind -N 'Kill current window' & { confirm-before -p\"kill-window #W? (y/n)\" kill-window }",
 		"bind -N 'Prompt for window index to select' \"'\" { command-prompt -T window-target -pindex { select-window -t ':%%' } }",
+		"bind -N 'New floating pane' * { new-pane }",
 		"bind -N 'Switch to previous client' ( { switch-client -p }",
 		"bind -N 'Switch to next client' ) { switch-client -n }",
 		"bind -N 'Rename current window' , { command-prompt -I'#W' { rename-window -- '%%' } }",
@@ -404,8 +406,10 @@ key_bindings_init(void)
 		"bind -N 'Choose a window from a list' w { choose-tree -Zw }",
 		"bind -N 'Kill the active pane' x { confirm-before -p\"kill-pane #P? (y/n)\" kill-pane }",
 		"bind -N 'Zoom the active pane' z { resize-pane -Z }",
-		"bind -N 'Swap the active pane with the pane above' '{' { swap-pane -U }",
-		"bind -N 'Swap the active pane with the pane below' '}' { swap-pane -D }",
+		"bind -N 'Move pane to top-left corner' '{' { resize-pane -x50% -y50%; move-pane -P top-left }",
+		"bind -N 'Move pane to top-right corner' '}' { resize-pane -x50% -y50%; move-pane -P top-right }",
+		"bind -N 'Move pane to bottom-left corner' 'M-{' { resize-pane -x50% -y50%; move-pane -P bottom-left }",
+		"bind -N 'Move pane to bottom-right corner' 'M-}' { resize-pane -x50% -y50%; move-pane -P bottom-right }",
 		"bind -N 'Show messages' '~' { show-messages }",
 		"bind -N 'Enter copy mode and scroll up' PPage { copy-mode -u }",
 		"bind -N 'Select the pane above the active pane' -r Up { select-pane -U }",
@@ -427,13 +431,13 @@ key_bindings_init(void)
 		"bind -N 'Move the visible part of the window left' -r S-Left { refresh-client -L 10 }",
 		"bind -N 'Move the visible part of the window right' -r S-Right { refresh-client -R 10 }",
 		"bind -N 'Reset so the visible part of the window follows the cursor' -r DC { refresh-client -c }",
-		"bind -N 'Resize the pane up by 5' -r M-Up { resize-pane -U 5 }",
+		"bind -N 'Resize the pane up by 5' -r M-Up if -F '#{?floating_pane_flag}' { resizep -D-5 } { resize-pane -U 5 }",
 		"bind -N 'Resize the pane down by 5' -r M-Down { resize-pane -D 5 }",
-		"bind -N 'Resize the pane left by 5' -r M-Left { resize-pane -L 5 }",
-		"bind -N 'Resize the pane right by 5' -r M-Right { resize-pane -R 5 }",
-		"bind -N 'Resize the pane up' -r C-Up { resize-pane -U }",
+		"bind -N 'Resize the pane left by 5' -r M-Left if -F '#{?floating_pane_flag}' { resizep -R-5 } { resize-pane -L 5 }",
+		"bind -N 'Resize the pane right by 5' -r M-Right resize-pane -R 5",
+		"bind -N 'Resize the pane up' -r C-Up if -F '#{?floating_pane_flag}' { resizep -D-1 } { resize-pane -U }",
 		"bind -N 'Resize the pane down' -r C-Down { resize-pane -D }",
-		"bind -N 'Resize the pane left' -r C-Left { resize-pane -L }",
+		"bind -N 'Resize the pane left' -r C-Left if -F '#{?floating_pane_flag}' { resizep -R-1 } { resize-pane -L }",
 		"bind -N 'Resize the pane right' -r C-Right { resize-pane -R }",
 
 		/* Menu keys */
@@ -459,12 +463,19 @@ key_bindings_init(void)
 		/* Mouse button 1 triple click on pane. */
 		"bind -n TripleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -H; send -X select-line; run -d0.3; send -X copy-pipe-and-cancel } }",
 
+		/* Mouse button 1 on border. */
+		"bind -n MouseDown1Border { select-pane -M }",
+
 		/* Mouse button 1 drag on border. */
 		"bind -n MouseDrag1Border { resize-pane -M }",
 
 		/* Mouse button 1 down on status line. */
 		"bind -n MouseDown1Status { switch-client -t= }",
 		"bind -n C-MouseDown1Status { swap-window -t@ }",
+
+		/* Mouse button 1 down on default pane-border-format */
+		"bind -n MouseDown1Control9 { display-menu -t= -xM -yM -O -T 'Kill pane #{pane_index}?' 'Yes' 'y' { kill-pane -t= } 'No' 'n' {}}",
+		"bind -n MouseDown1Control8 { resize-pane -Z }",
 
 		/* Mouse wheel down on status line. */
 		"bind -n WheelDownStatus { next-window }",
@@ -498,7 +509,7 @@ key_bindings_init(void)
 		"bind -Tcopy-mode C-b { send -X cursor-left }",
 		"bind -Tcopy-mode C-g { send -X clear-selection }",
 		"bind -Tcopy-mode C-k { send -X copy-pipe-end-of-line-and-cancel }",
-		"bind -Tcopy-mode C-l { send -X cursor-centre-vertical }",
+		"bind -Tcopy-mode C-l { send -X recentre-top-bottom }",
 		"bind -Tcopy-mode M-l { send -X cursor-centre-horizontal }",
 		"bind -Tcopy-mode C-n { send -X cursor-down }",
 		"bind -Tcopy-mode C-p { send -X cursor-up }",
@@ -507,6 +518,7 @@ key_bindings_init(void)
 		"bind -Tcopy-mode C-v { send -X page-down }",
 		"bind -Tcopy-mode C-w { send -X copy-pipe-and-cancel }",
 		"bind -Tcopy-mode Escape { send -X cancel }",
+		"bind -Tcopy-mode C-[ { send -X cancel }",
 		"bind -Tcopy-mode Space { send -X page-down }",
 		"bind -Tcopy-mode , { send -X jump-reverse }",
 		"bind -Tcopy-mode \\; { send -X jump-again }",
@@ -520,7 +532,7 @@ key_bindings_init(void)
 		"bind -Tcopy-mode g { command-prompt -p'(goto line)' { send -X goto-line -- '%%' } }",
 		"bind -Tcopy-mode n { send -X search-again }",
 		"bind -Tcopy-mode q { send -X cancel }",
-		"bind -Tcopy-mode r { send -X refresh-from-pane }",
+		"bind -Tcopy-mode r { send -X refresh-toggle }",
 		"bind -Tcopy-mode t { command-prompt -1p'(jump to forward)' { send -X jump-to-forward -- '%%' } }",
 		"bind -Tcopy-mode Home { send -X start-of-line }",
 		"bind -Tcopy-mode End { send -X end-of-line }",
@@ -580,6 +592,7 @@ key_bindings_init(void)
 		"bind -Tcopy-mode-vi C-v { send -X rectangle-toggle }",
 		"bind -Tcopy-mode-vi C-y { send -X scroll-up }",
 		"bind -Tcopy-mode-vi Escape { send -X clear-selection }",
+		"bind -Tcopy-mode-vi C-[ { send -X clear-selection }",
 		"bind -Tcopy-mode-vi Space { send -X begin-selection }",
 		"bind -Tcopy-mode-vi '$' { send -X end-of-line }",
 		"bind -Tcopy-mode-vi , { send -X jump-reverse }",
@@ -627,7 +640,7 @@ key_bindings_init(void)
 		"bind -Tcopy-mode-vi n { send -X search-again }",
 		"bind -Tcopy-mode-vi o { send -X other-end }",
 		"bind -Tcopy-mode-vi q { send -X cancel }",
-		"bind -Tcopy-mode-vi r { send -X refresh-from-pane }",
+		"bind -Tcopy-mode-vi r { send -X refresh-toggle }",
 		"bind -Tcopy-mode-vi t { command-prompt -1p'(jump to forward)' { send -X jump-to-forward -- '%%' } }",
 		"bind -Tcopy-mode-vi v { send -X rectangle-toggle }",
 		"bind -Tcopy-mode-vi w { send -X next-word }",

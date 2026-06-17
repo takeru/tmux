@@ -70,13 +70,13 @@ static const char *options_table_pane_scrollbars_position_list[] = {
 	"right", "left", NULL
 };
 static const char *options_table_pane_status_list[] = {
-	"off", "top", "bottom", NULL
+	"off", "top", "bottom", "top-floating", "bottom-floating", NULL
 };
 static const char *options_table_pane_border_indicators_list[] = {
 	"off", "colour", "arrows", "both", NULL
 };
 static const char *options_table_pane_border_lines_list[] = {
-	"single", "double", "heavy", "simple", "number", "spaces", NULL
+	"single", "double", "heavy", "simple", "number", "spaces", "none", NULL
 };
 static const char *options_table_popup_border_lines_list[] = {
 	"single", "double", "heavy", "simple", "rounded", "padded", "none", NULL
@@ -91,7 +91,7 @@ static const char *options_table_window_size_list[] = {
 	"largest", "smallest", "manual", "latest", NULL
 };
 static const char *options_table_remain_on_exit_list[] = {
-	"off", "on", "failed", NULL
+	"off", "on", "failed", "key", NULL
 };
 static const char *options_table_destroy_unattached_list[] = {
 	"off", "on", "keep-last", "keep-group", NULL
@@ -107,6 +107,9 @@ static const char *options_table_extended_keys_format_list[] = {
 };
 static const char *options_table_allow_passthrough_list[] = {
 	"off", "on", "all", NULL
+};
+static const char *options_table_copy_mode_line_numbers_list[] = {
+	"off", "default", "absolute", "relative", "hybrid", NULL
 };
 
 /* Status line format. */
@@ -141,7 +144,7 @@ static const char *options_table_allow_passthrough_list[] = {
 		"#{T:window-status-format}" \
 		"#[pop-default]" \
 		"#[norange default]" \
-		"#{?loop_last_flag,,#{window-status-separator}}" \
+		"#{?loop_last_flag,,#{E:window-status-separator}}" \
 	"," \
 		"#[range=window|#{window_index} list=focus " \
 			"#{?#{!=:#{E:window-status-current-style},default}," \
@@ -168,7 +171,7 @@ static const char *options_table_allow_passthrough_list[] = {
 		"#{T:window-status-current-format}" \
 		"#[pop-default]" \
 		"#[norange list=on default]" \
-		"#{?loop_last_flag,,#{window-status-separator}}" \
+		"#{?loop_last_flag,,#{E:window-status-separator}}" \
 	"}" \
 	"#[nolist align=right range=right #{E:status-right-style}]" \
 	"#[push-default]" \
@@ -185,7 +188,7 @@ static const char *options_table_allow_passthrough_list[] = {
 			"#{E:pane-status-style}" \
 		"]" \
 		"#[push-default]" \
-		"#P[#{pane_width}x#{pane_height}]" \
+		"#{T:window-pane-status-format}" \
 		"#[pop-default]" \
 		"#[norange list=on default]  " \
 	"," \
@@ -196,7 +199,7 @@ static const char *options_table_allow_passthrough_list[] = {
 			"}" \
 		"]" \
 		"#[push-default]" \
-		"#P[#{pane_width}x#{pane_height}]*" \
+		"#{T:window-pane-current-status-format}" \
 		"#[pop-default]" \
 		"#[norange list=on default] " \
 	"}"
@@ -414,10 +417,10 @@ const struct options_table_entry options_table[] = {
 	  .choices = options_table_get_clipboard_list,
 	  .default_num = 1,
 	  .text = "When an application requests the clipboard, whether to "
-	          "ignore the request ('off'); respond with the newest buffer "
-	          "('buffer'); request the clipboard from the most recently "
-	          "used terminal ('request'); or to request the clipboard, "
-	          "create a buffer, and send it to the application ('both')."
+		  "ignore the request ('off'); respond with the newest buffer "
+		  "('buffer'); request the clipboard from the most recently "
+		  "used terminal ('request'); or to request the clipboard, "
+		  "create a buffer, and send it to the application ('both')."
 	},
 
 	{ .name = "history-file",
@@ -644,6 +647,14 @@ const struct options_table_entry options_table[] = {
 	  .text = "Colour of not active panes for 'display-panes'."
 	},
 
+	{ .name = "display-panes-format",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .default_str = "#[align=right]#{pane_width}x#{pane_height}",
+	  .text = "Format of text shown by 'display-panes', expanded for each "
+		  "pane."
+	},
+
 	{ .name = "display-panes-time",
 	  .type = OPTIONS_TABLE_NUMBER,
 	  .scope = OPTIONS_TABLE_SESSION,
@@ -723,11 +734,22 @@ const struct options_table_entry options_table[] = {
 	{ .name = "message-command-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SESSION,
-	  .default_str = "bg=black,fg=yellow",
+	  .default_str = "bg=black,fg=yellow,fill=black",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Style of the command prompt when in command mode, if "
-		  "'mode-keys' is set to 'vi'."
+		  "'status-keys' is set to 'vi'."
+	},
+
+	{ .name = "message-format",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .default_str = "#[#{?#{command_prompt},"
+		  "#{E:message-command-style},"
+		  "#{E:message-style}}]"
+		  "#{message}",
+	  .text = "Format string for the prompt and message area. "
+		  "The '#{message}' placeholder is replaced with the content."
 	},
 
 	{ .name = "message-line",
@@ -741,10 +763,13 @@ const struct options_table_entry options_table[] = {
 	{ .name = "message-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SESSION,
-	  .default_str = "bg=yellow,fg=black",
+	  .default_str = "bg=yellow,fg=black,fill=yellow",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
-	  .text = "Style of messages and the command prompt."
+	  .text = "Style of messages and the command prompt. "
+		  "A 'fill' attribute controls background clearing and "
+		  "a 'width' attribute (fixed or percentage) constrains "
+		  "the prompt area width."
 	},
 
 	{ .name = "mouse",
@@ -1027,7 +1052,9 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_SESSION,
 	  .flags = OPTIONS_TABLE_IS_ARRAY,
 	  .default_str = "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK "
-			 "SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY",
+			 "SSH_AGENT_PID SSH_CONNECTION WAYLAND_DISPLAY "
+			 "WINDOWID XAUTHORITY XDG_CURRENT_DESKTOP "
+			 "XDG_SESSION_DESKTOP XDG_SESSION_TYPE",
 	  .text = "List of environment variables to update in the session "
 		  "environment when a client is attached."
 	},
@@ -1178,7 +1205,7 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_str = "#[align=right]"
 			 "#{t/p:top_line_time}#{?#{e|>:#{top_line_time},0}, ,}"
-			 "[#{scroll_position}/#{history_size}]"
+			 "[#{copy_position}/#{copy_position_limit}]"
 			 "#{?search_timed_out, (timed out),"
 			 "#{?search_count, (#{search_count}"
 			 "#{?search_count_partial,+,} results),}}",
@@ -1201,6 +1228,32 @@ const struct options_table_entry options_table[] = {
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Style of selection in copy mode."
+	},
+
+	{ .name = "copy-mode-current-line-number-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "fg=yellow",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of current line number in copy mode."
+	},
+
+	{ .name = "copy-mode-line-number-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "fg=white,dim",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of line numbers in copy mode."
+	},
+
+	{ .name = "copy-mode-line-numbers",
+	  .type = OPTIONS_TABLE_CHOICE,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .choices = options_table_copy_mode_line_numbers_list,
+	  .default_num = 0,
+	  .text = "Line number mode in copy mode."
 	},
 
 	{ .name = "fill-character",
@@ -1286,7 +1339,7 @@ const struct options_table_entry options_table[] = {
 
 	{ .name = "pane-active-border-style",
 	  .type = OPTIONS_TABLE_STRING,
-	  .scope = OPTIONS_TABLE_WINDOW,
+	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_str = "#{?pane_in_mode,fg=yellow,#{?synchronize-panes,fg=red,fg=green}}",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
@@ -1306,7 +1359,14 @@ const struct options_table_entry options_table[] = {
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_str = "#{?pane_active,#[reverse],}#{pane_index}#[default] "
-			 "\"#{pane_title}\"",
+			 "\"#{pane_title}\""
+			 "#{?#{mouse},"
+				"#[align=right]"
+				"#[range=control|8]["
+					"#{?#{window_zoomed_flag},u,z}"
+				"]#[norange]"
+				"#[range=control|9][x]#[norange]"
+			",}",
 	  .text = "Format of text in the pane status lines."
 	},
 
@@ -1321,7 +1381,7 @@ const struct options_table_entry options_table[] = {
 
 	{ .name = "pane-border-lines",
 	  .type = OPTIONS_TABLE_CHOICE,
-	  .scope = OPTIONS_TABLE_WINDOW,
+	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .choices = options_table_pane_border_lines_list,
 	  .default_num = PANE_LINES_SINGLE,
 	  .text = "Type of characters used to draw pane border lines. Some of "
@@ -1330,7 +1390,7 @@ const struct options_table_entry options_table[] = {
 
 	{ .name = "pane-border-status",
 	  .type = OPTIONS_TABLE_CHOICE,
-	  .scope = OPTIONS_TABLE_WINDOW,
+	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .choices = options_table_pane_status_list,
 	  .default_num = PANE_STATUS_OFF,
 	  .text = "Position of the pane status lines."
@@ -1338,7 +1398,7 @@ const struct options_table_entry options_table[] = {
 
 	{ .name = "pane-border-style",
 	  .type = OPTIONS_TABLE_STRING,
-	  .scope = OPTIONS_TABLE_WINDOW,
+	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_str = "default",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
@@ -1410,8 +1470,9 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .choices = options_table_remain_on_exit_list,
 	  .default_num = 0,
-	  .text = "Whether panes should remain ('on') or be automatically "
-		  "killed ('off' or 'failed') when the program inside exits."
+	  .text = "Whether panes should remain ('on'), remain until a key is "
+		  "pressed ('key') or be automatically killed ('off' or "
+		  "'failed') when the program inside exits."
 	},
 
 	{ .name = "remain-on-exit-format",
@@ -1452,6 +1513,28 @@ const struct options_table_entry options_table[] = {
 		  "A value of 0 means no limit."
 	},
 
+	{ .name = "tree-mode-preview-format",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
+	  .default_str = "#{?pane_format,"
+			 "#{pane_index}:#{pane_title},"
+			 "#{window_index}:#{window_name}}",
+	  .text = "Format of the preview indicator in tree mode."
+	},
+
+	{ .name = "tree-mode-preview-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "fg=#{?#{||:"
+			 "#{&&:#{pane_format},#{pane_active}},"
+			 "#{&&:#{window_format},#{window_active}}},"
+			 "#{display-panes-active-colour},"
+			 "#{display-panes-colour}}",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of preview indicator in tree mode."
+	},
+
 	{ .name = "window-active-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
@@ -1459,6 +1542,21 @@ const struct options_table_entry options_table[] = {
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Default style of the active pane."
+	},
+
+	{ .name = "window-pane-current-status-format",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "#P:[#T]#{?pane_flags,#{pane_flags}, }",
+	  .text = "Format of the current window pane in the status line."
+	},
+
+	{ .name = "window-pane-status-format",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "#P:[#T]#{?pane_flags,#{pane_flags}, }",
+	  .text = "Format of window panes in the status line, except the "
+		  "current pane."
 	},
 
 	{ .name = "window-size",

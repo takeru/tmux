@@ -175,7 +175,7 @@ window_clock_init(struct window_mode_entry *wme,
 	struct window_clock_mode_data	*data;
 	struct screen			*s;
 
-	wme->data = data = xmalloc(sizeof *data);
+	wme->data = data = xcalloc(1, sizeof *data);
 	data->tim = time(NULL);
 
 	evtimer_set(&data->timer, window_clock_timer_callback, wme);
@@ -279,6 +279,7 @@ window_clock_draw_screen(struct window_mode_entry *wme)
 	memcpy(&gc, &grid_default_cell, sizeof gc);
 	gc.flags |= GRID_FLAG_NOPALETTE;
 	gc.bg = colour;
+	gc.fg = colour;
 	for (ptr = tim; *ptr != '\0'; ptr++) {
 		if (*ptr >= '0' && *ptr <= '9')
 			idx = *ptr - '0';
@@ -299,7 +300,7 @@ window_clock_draw_screen(struct window_mode_entry *wme)
 			for (i = 0; i < 5; i++) {
 				screen_write_cursormove(&ctx, x + i, y + j, 0);
 				if (window_clock_table[idx][j][i])
-					screen_write_putc(&ctx, &gc, ' ');
+					screen_write_putc(&ctx, &gc, '#');
 			}
 		}
 		x += 6;

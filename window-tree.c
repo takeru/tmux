@@ -38,8 +38,8 @@ static void		 window_tree_key(struct window_mode_entry *,
 
 #define WINDOW_TREE_DEFAULT_FORMAT \
 	"#{?pane_format," \
-		"#{?pane_marked,#[reverse],}" \
-		"#{pane_current_command}#{?pane_active,*,}#{?pane_marked,M,}" \
+		"#{?pane_marked,#[reverse],}#{?pane_floating_flag,#[italics],}" \
+		"#{pane_current_command}#{pane_flags}" \
 		"#{?#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}},: \"#{pane_title}\",}" \
 	",window_format," \
 		"#{?window_marked_flag,#[reverse],}" \
@@ -113,6 +113,7 @@ struct window_tree_modedata {
 	char				 *key_format;
 	char				 *command;
 	int				  squash_groups;
+	int				  hide_preview_this_pane;
 	int				  prompt_flags;
 
 	struct window_tree_itemdata	**item_list;
@@ -136,6 +137,7 @@ static enum sort_order window_tree_order_seq[] = {
 	SORT_INDEX,
 	SORT_NAME,
 	SORT_ACTIVITY,
+	SORT_Z,
 	SORT_END,
 };
 
@@ -288,6 +290,8 @@ window_tree_build_window(struct session *s, struct winlink *wl,
 	if (n == 0)
 		goto empty;
 	for (i = 0; i < n; i++) {
+		if (data->hide_preview_this_pane && l[i] == data->wp)
+			continue;
 		if (window_tree_filter_pane(s, wl, l[i], filter))
 			window_tree_build_pane(s, wl, l[i], modedata, mti);
 	}
@@ -351,6 +355,7 @@ window_tree_build(void *modedata, struct sort_criteria *sort_crit,
     uint64_t *tag, const char *filter)
 {
 	struct window_tree_modedata	*data = modedata;
+	int				 squash_groups = data->squash_groups;
 	struct session			*s, **l;
 	struct session_group		*sg, *current;
 	u_int				 n, i;
@@ -366,15 +371,14 @@ window_tree_build(void *modedata, struct sort_criteria *sort_crit,
 	l = sort_get_sessions(&n, sort_crit);
 	if (n == 0)
 		return;
-	s = l[n - 1];
 	for (i = 0; i < n; i++) {
-		if (data->squash_groups &&
-		    (sg = session_group_contains(s)) != NULL) {
+		s = l[i];
+		if (squash_groups && (sg = session_group_contains(s)) != NULL) {
 			if ((sg == current && s != data->fs.s) ||
 			    (sg != current && s != TAILQ_FIRST(&sg->sessions)))
 				continue;
 		}
-		window_tree_build_session(l[i], modedata, sort_crit, filter);
+		window_tree_build_session(s, modedata, sort_crit, filter);
 	}
 
 	switch (data->type) {
@@ -387,7 +391,7 @@ window_tree_build(void *modedata, struct sort_criteria *sort_crit,
 		*tag = (uint64_t)data->fs.wl;
 		break;
 	case WINDOW_TREE_PANE:
-		if (window_count_panes(data->fs.wl->window) == 1)
+		if (window_count_panes(data->fs.wl->window, 1) == 1)
 			*tag = (uint64_t)data->fs.wl;
 		else
 			*tag = (uint64_t)data->fs.wp;
@@ -399,43 +403,48 @@ static void
 window_tree_draw_label(struct screen_write_ctx *ctx, u_int px, u_int py,
     u_int sx, u_int sy, const struct grid_cell *gc, const char *label)
 {
-	size_t	 len;
-	u_int	 ox, oy;
+	u_int	 width, ox, oy;
+	char	*new_label = NULL;
 
-	len = strlen(label);
-	if (sx == 0 || sy == 1 || len > sx)
+	if (sx < 5 || sy < 3)
 		return;
-	ox = (sx - len + 1) / 2;
+	width = format_width(label);
+	if (width > sx - 4) {
+		label = new_label = format_trim_left(label, sx - 4);
+		width = format_width(new_label);
+	}
+	if (width == 0)
+		return;
+	ox = (sx - width + 1) / 2;
 	oy = (sy + 1) / 2;
 
-	if (ox > 1 && ox + len < sx - 1 && sy >= 3) {
-		screen_write_cursormove(ctx, px + ox - 1, py + oy - 1, 0);
-		screen_write_box(ctx, len + 2, 3, BOX_LINES_DEFAULT, NULL,
-		    NULL);
-	}
+	screen_write_cursormove(ctx, px + ox - 2, py + oy - 1, 0);
+	screen_write_box(ctx, width + 4, 3, BOX_LINES_DEFAULT,
+	    NULL, NULL);
+	screen_write_cursormove(ctx, px + ox - 1, py + oy, 0);
+	screen_write_clearcharacter(ctx, width + 2, 8);
 	screen_write_cursormove(ctx, px + ox, py + oy, 0);
-	screen_write_puts(ctx, gc, "%s", label);
+	format_draw(ctx, gc, width, label, NULL, 0);
+	free(new_label);
 }
 
 static void
 window_tree_draw_session(struct window_tree_modedata *data, struct session *s,
     struct screen_write_ctx *ctx, u_int sx, u_int sy)
 {
-	struct options		*oo = s->options;
 	struct winlink		*wl;
 	struct window		*w;
 	u_int			 cx = ctx->s->cx, cy = ctx->s->cy;
 	u_int			 loop, total, visible, each, width, offset;
 	u_int			 current, start, end, remaining, i;
 	struct grid_cell	 gc;
-	int			 colour, active_colour, left, right;
+	int			 left, right;
 	char			*label;
+	const char		*format;
+	struct format_tree	*ft;
+	struct options		*oo;
 
 	total = winlink_count(&s->windows);
-
-	memcpy(&gc, &grid_default_cell, sizeof gc);
-	colour = options_get_number(oo, "display-panes-colour");
-	active_colour = options_get_number(oo, "display-panes-active-colour");
 
 	if (sx / total < 24) {
 		visible = sx / 24;
@@ -516,11 +525,13 @@ window_tree_draw_session(struct window_tree_modedata *data, struct session *s,
 			continue;
 		}
 		w = wl->window;
+		oo = w->options;
 
-		if (wl == s->curw)
-			gc.fg = active_colour;
-		else
-			gc.fg = colour;
+		ft = format_create(NULL, NULL, FORMAT_WINDOW|w->id, 0);
+		format_defaults(ft, NULL, s, wl, NULL);
+
+		memcpy(&gc, &grid_default_cell, sizeof gc);
+		style_apply(&gc, oo, "tree-mode-preview-style", ft);
 
 		if (left)
 			offset = 3 + (i * each);
@@ -534,17 +545,19 @@ window_tree_draw_session(struct window_tree_modedata *data, struct session *s,
 		screen_write_cursormove(ctx, cx + offset, cy, 0);
 		screen_write_preview(ctx, &w->active->base, width, sy);
 
-		xasprintf(&label, " %u:%s ", wl->idx, w->name);
-		if (strlen(label) > width) {
+		format = options_get_string(oo, "tree-mode-preview-format");
+		if (*format != '\0') {
+			label = format_expand(ft, format);
+			if (*label != '\0') {
+				window_tree_draw_label(ctx, cx + offset, cy,
+				    width, sy, &gc, label);
+			}
 			free(label);
-			xasprintf(&label, " %u ", wl->idx);
 		}
-		window_tree_draw_label(ctx, cx + offset, cy, width, sy, &gc,
-		    label);
-		free(label);
 
 		if (loop != end - 1) {
-			screen_write_cursormove(ctx, cx + offset + width, cy, 0);
+			screen_write_cursormove(ctx, cx + offset + width, cy,
+			    0);
 			screen_write_vline(ctx, sy, 0, 0);
 		}
 		loop++;
@@ -555,22 +568,25 @@ window_tree_draw_session(struct window_tree_modedata *data, struct session *s,
 
 static void
 window_tree_draw_window(struct window_tree_modedata *data, struct session *s,
-    struct window *w, struct screen_write_ctx *ctx, u_int sx, u_int sy)
+    struct winlink *wl, struct screen_write_ctx *ctx, u_int sx, u_int sy)
 {
-	struct options		*oo = s->options;
+	struct window		*w = wl->window;
 	struct window_pane	*wp;
 	u_int			 cx = ctx->s->cx, cy = ctx->s->cy;
 	u_int			 loop, total, visible, each, width, offset;
-	u_int			 current, start, end, remaining, i, pane_idx;
+	u_int			 current, start, end, remaining, i;
 	struct grid_cell	 gc;
-	int			 colour, active_colour, left, right;
+	int			 left, right;
 	char			*label;
+	const char		*format;
+	struct format_tree	*ft;
+	struct options		*oo;
 
-	total = window_count_panes(w);
-
-	memcpy(&gc, &grid_default_cell, sizeof gc);
-	colour = options_get_number(oo, "display-panes-colour");
-	active_colour = options_get_number(oo, "display-panes-active-colour");
+	total = window_count_panes(w, 1);
+	if (data->hide_preview_this_pane && data->wp->window == w)
+		total--;
+	if (total == 0)
+		return;
 
 	if (sx / total < 24) {
 		visible = sx / 24;
@@ -581,6 +597,8 @@ window_tree_draw_window(struct window_tree_modedata *data, struct session *s,
 
 	current = 0;
 	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (data->hide_preview_this_pane && wp == data->wp)
+			continue;
 		if (wp == w->active)
 			break;
 		current++;
@@ -644,17 +662,21 @@ window_tree_draw_window(struct window_tree_modedata *data, struct session *s,
 
 	i = loop = 0;
 	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (data->hide_preview_this_pane && wp == data->wp)
+			continue;
 		if (loop == end)
 			break;
 		if (loop < start) {
 			loop++;
 			continue;
 		}
+		oo = wp->options;
 
-		if (wp == w->active)
-			gc.fg = active_colour;
-		else
-			gc.fg = colour;
+		ft = format_create(NULL, NULL, FORMAT_PANE|wp->id, 0);
+		format_defaults(ft, NULL, s, wl, wp);
+
+		memcpy(&gc, &grid_default_cell, sizeof gc);
+		style_apply(&gc, oo, "tree-mode-preview-style", ft);
 
 		if (left)
 			offset = 3 + (i * each);
@@ -668,15 +690,19 @@ window_tree_draw_window(struct window_tree_modedata *data, struct session *s,
 		screen_write_cursormove(ctx, cx + offset, cy, 0);
 		screen_write_preview(ctx, &wp->base, width, sy);
 
-		if (window_pane_index(wp, &pane_idx) != 0)
-			pane_idx = loop;
-		xasprintf(&label, " %u ", pane_idx);
-		window_tree_draw_label(ctx, cx + offset, cy, each, sy, &gc,
-		    label);
-		free(label);
+		format = options_get_string(oo, "tree-mode-preview-format");
+		if (*format != '\0') {
+			label = format_expand(ft, format);
+			if (*label != '\0') {
+				window_tree_draw_label(ctx, cx + offset, cy,
+				    width, sy, &gc, label);
+			}
+			free(label);
+		}
 
 		if (loop != end - 1) {
-			screen_write_cursormove(ctx, cx + offset + width, cy, 0);
+			screen_write_cursormove(ctx, cx + offset + width, cy,
+			    0);
 			screen_write_vline(ctx, sy, 0, 0);
 		}
 		loop++;
@@ -689,12 +715,13 @@ static void
 window_tree_draw(void *modedata, void *itemdata, struct screen_write_ctx *ctx,
     u_int sx, u_int sy)
 {
+	struct window_tree_modedata	*data = modedata;
 	struct window_tree_itemdata	*item = itemdata;
 	struct session			*sp;
-	struct winlink			*wlp;
+	struct winlink			*wl;
 	struct window_pane		*wp;
 
-	window_tree_pull_item(item, &sp, &wlp, &wp);
+	window_tree_pull_item(item, &sp, &wl, &wp);
 	if (wp == NULL)
 		return;
 
@@ -705,10 +732,11 @@ window_tree_draw(void *modedata, void *itemdata, struct screen_write_ctx *ctx,
 		window_tree_draw_session(modedata, sp, ctx, sx, sy);
 		break;
 	case WINDOW_TREE_WINDOW:
-		window_tree_draw_window(modedata, sp, wlp->window, ctx, sx, sy);
+		window_tree_draw_window(modedata, sp, wl, ctx, sx, sy);
 		break;
 	case WINDOW_TREE_PANE:
-		screen_write_preview(ctx, &wp->base, sx, sy);
+		if (!data->hide_preview_this_pane || wp != data->wp)
+			screen_write_preview(ctx, &wp->base, sx, sy);
 		break;
 	}
 }
@@ -860,6 +888,30 @@ window_tree_sort(struct sort_criteria *sort_crit)
 		sort_crit->order = sort_crit->order_seq[0];
 }
 
+static const char* window_tree_help_lines[] = {
+	"\r\033[1m      Enter \033[0m\016x\017 \033[0mChoose selected item\n",
+	"\r\033[1m       S-Up \033[0m\016x\017 \033[0mSwap current and previous window\n",
+	"\r\033[1m     S-Down \033[0m\016x\017 \033[0mSwap current and next window\n",
+	"\r\033[1m          x \033[0m\016x\017 \033[0mKill selected item\n",
+	"\r\033[1m          X \033[0m\016x\017 \033[0mKill tagged items\n",
+	"\r\033[1m          < \033[0m\016x\017 \033[0mScroll previews left\n",
+	"\r\033[1m          > \033[0m\016x\017 \033[0mScroll previews right\n",
+	"\r\033[1m          m \033[0m\016x\017 \033[0mSet the marked pane\n",
+	"\r\033[1m          M \033[0m\016x\017 \033[0mClear the marked pane\n",
+	"\r\033[1m          : \033[0m\016x\017 \033[0mRun a command for each tagged item\n",
+	"\r\033[1m          f \033[0m\016x\017 \033[0mEnter a format\n",
+	"\r\033[1m          H \033[0m\016x\017 \033[0mJump to the starting pane\n",
+	NULL
+};
+
+static const char**
+window_tree_help(u_int *width, const char **item)
+{
+	*width = 51;
+	*item = "item";
+	return (window_tree_help_lines);
+}
+
 static struct screen *
 window_tree_init(struct window_mode_entry *wme, struct cmd_find_state *fs,
     struct args *args)
@@ -893,13 +945,14 @@ window_tree_init(struct window_mode_entry *wme, struct cmd_find_state *fs,
 	else
 		data->command = xstrdup(args_string(args, 0));
 	data->squash_groups = !args_has(args, 'G');
+	data->hide_preview_this_pane = args_has(args, 'h');
 	if (args_has(args, 'y'))
 		data->prompt_flags = PROMPT_ACCEPT;
 
 	data->data = mode_tree_start(wp, args, window_tree_build,
 	    window_tree_draw, window_tree_search, window_tree_menu, NULL,
-	    window_tree_get_key, window_tree_swap, window_tree_sort, data,
-	    window_tree_menu_items, &s);
+	    window_tree_get_key, window_tree_swap, window_tree_sort,
+	    window_tree_help, data, window_tree_menu_items, &s);
 	mode_tree_zoom(data->data, args);
 
 	mode_tree_build(data->data);

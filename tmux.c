@@ -281,6 +281,42 @@ get_timer(void)
 	return ((ts.tv_sec * 1000ULL) + (ts.tv_nsec / 1000000ULL));
 }
 
+char *
+clean_name(const char *name, const char* forbid)
+{
+	char	*copy, *cp, *new_name;
+
+	if (*name == '\0' || !utf8_isvalid(name))
+		return (NULL);
+	copy = xstrdup(name);
+	for (cp = copy; *cp != '\0'; cp++) {
+		if (strchr(forbid, *cp) != NULL)
+			*cp = '_';
+	}
+	utf8_stravis(&new_name, copy, VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
+	free(copy);
+	return (new_name);
+}
+
+/*
+ * Check a name given by a command: reject it if it is empty, not valid UTF-8,
+ * or contains a forbidden character. Other characters that clean_name would
+ * change (for example with utf8_stravis) are allowed and fixed silently.
+ */
+int
+check_name(const char *name, const char *forbid)
+{
+	const char	*cp;
+
+	if (*name == '\0' || !utf8_isvalid(name))
+		return (0);
+	for (cp = name; *cp != '\0'; cp++) {
+		if (strchr(forbid, *cp) != NULL)
+			return (0);
+	}
+	return (1);
+}
+
 const char *
 sig2name(int signo)
 {

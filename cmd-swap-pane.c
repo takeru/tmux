@@ -79,6 +79,12 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 	if (src_wp == dst_wp)
 		goto out;
 
+	if (window_pane_is_floating(src_wp) ||
+	    window_pane_is_floating(dst_wp)) {
+		cmdq_error(item, "cannot swap floating panes");
+		return (CMD_RETURN_ERROR);
+	}
+
 	server_client_remove_pane(src_wp);
 	server_client_remove_pane(dst_wp);
 
@@ -91,6 +97,16 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 		TAILQ_INSERT_HEAD(&dst_w->panes, src_wp, entry);
 	else
 		TAILQ_INSERT_AFTER(&dst_w->panes, tmp_wp, src_wp, entry);
+
+	tmp_wp = TAILQ_PREV(dst_wp, window_panes, zentry);
+	TAILQ_REMOVE(&dst_w->z_index, dst_wp, zentry);
+	TAILQ_REPLACE(&src_w->z_index, src_wp, dst_wp, zentry);
+	if (tmp_wp == src_wp)
+		tmp_wp = dst_wp;
+	if (tmp_wp == NULL)
+		TAILQ_INSERT_HEAD(&dst_w->z_index, src_wp, zentry);
+	else
+		TAILQ_INSERT_AFTER(&dst_w->z_index, tmp_wp, src_wp, zentry);
 
 	src_lc = src_wp->layout_cell;
 	dst_lc = dst_wp->layout_cell;
